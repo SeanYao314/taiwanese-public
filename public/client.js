@@ -319,6 +319,11 @@
   ];
 
   const sweat = {
+    mode: 'solo',      // 'solo' (this browser arranged every seat) or 'mp' (server-driven room)
+    mpCode: null,
+    mpIsHost: false,
+    mpHostId: null,
+    pendingSwing: null, // multiplayer only — the server-computed river outs check, mirrored to every viewer
     players: [],      // [{id, name, assignment}]
     boardA: [],
     boardB: [],
@@ -329,6 +334,8 @@
   };
 
   function startSweat() {
+    sweat.mode = 'solo';
+    sweat.pendingSwing = null;
     sweat.players = setup.ids.map((id, idx) => ({
       id, name: setup.names[idx], assignment: setup.assignments[id]
     }));
@@ -349,7 +356,19 @@
     recomputeStanding();
   }
 
-  el('btnNewHand').addEventListener('click', () => {
+  el('btnNewHand').addEventListener('click', async () => {
+    if (sweat.mode === 'mp') {
+      if (sweat.mpIsHost) {
+        el('btnNewHand').disabled = true;
+        const resp = await mpApi('POST', `/api/rooms/${mp.code}/new-hand`, { playerId: mp.playerId });
+        el('btnNewHand').disabled = false;
+        if (resp.error) { alert(resp.error); return; }
+        handleMpRoomUpdate(resp.room);
+      }
+      // non-host players just wait — the next poll tick will see phase go back to 'lobby'
+      // and handleMpRoomUpdate will bring everyone back to the room screen automatically.
+      return;
+    }
     hide('sweatScreen');
     show('setupScreen');
     show('preDealPanel');
@@ -357,13 +376,27 @@
     setup.dealt = null;
   });
 
+  // Only the host can actually start a new hand — hide the control for everyone else once
+  // we know we're in a multiplayer room (toggled from applyRoomToSweat/renderGuestWaiting).
+  function syncNewHandButtonVisibility() {
+    const btn = el('btnNewHand');
+    if (sweat.mode === 'mp' && !sweat.mpIsHost) btn.classList.add('hidden');
+    else btn.classList.remove('hidden');
+  }
+
+  // Always renders exactly 5 slots per board, using only indices < revealedCount for the
+  // face-up cards. This works whether `sweat.boardA/B` holds the FULL 5-card board (solo —
+  // we already know every card locally, revealedA/B is just a display cursor) or only the
+  // cards actually revealed so far (multiplayer — the server never sends an unrevealed
+  // board card over the wire at all, for real privacy, so the array itself is only as long
+  // as revealedA/B) — either way we only ever read index < revealedA/B.
   function renderBoards() {
     const boardACards = el('boardACards');
     const boardBCards = el('boardBCards');
     boardACards.innerHTML = '';
     boardBCards.innerHTML = '';
-    sweat.boardA.forEach((c, i) => boardACards.appendChild(i < sweat.revealedA ? cardEl(c) : cardBackEl()));
-    sweat.boardB.forEach((c, i) => boardBCards.appendChild(i < sweat.revealedB ? cardEl(c) : cardBackEl()));
+    for (let i = 0; i < 5; i++) boardACards.appendChild(i < sweat.revealedA ? cardEl(sweat.boardA[i]) : cardBackEl());
+    for (let i = 0; i < 5; i++) boardBCards.appendChild(i < sweat.revealedB ? cardEl(sweat.boardB[i]) : cardBackEl());
   }
 
   // ---------------------------------------------------------------------
@@ -585,6 +618,14 @@
   // ---------------------------------------------------------------------
   function renderStage() {
     const stage = REVEAL_STAGES[sweat.stageIndex];
+    if (sweat.mode === 'mp') {
+      if (!sweat.mpIsHost) { renderGuestWaiting(stage.id); return; }
+      if (stage.id === 'flops') renderFlopsControlMp();
+      else if (stage.id === 'turnA' || stage.id === 'turnB') renderTurnControlMp(stage.board);
+      else if (stage.id === 'riverA' || stage.id === 'riverB') renderRiverStageMp(stage.board);
+      else renderDoneStageMp();
+      return;
+    }
     if (stage.id === 'flops') renderFlopsControl();
     else if (stage.id === 'turnA' || stage.id === 'turnB') renderTurnControl(stage.board);
     else if (stage.id === 'riverA' || stage.id === 'riverB') renderRiverStage(stage.board);
@@ -723,16 +764,22 @@
   // ---------------------------------------------------------------------
   // Baccarat-style hold-to-peel card
   // ---------------------------------------------------------------------
+  // `card` may be null — in multiplayer the server never sends an unrevealed card's value
+  // to ANY client (not even the host), so the peel plays out without knowing what's
+  // underneath until the hold completes and the reveal is confirmed server-side; the caller
+  // swaps in the real board state (via renderBoards) once that confirmation comes back.
   function createPeelCard(card, onComplete) {
-    const rank = card[0];
-    const suit = card[1];
+    const rank = card ? card[0] : '?';
+    const suit = card ? card[1] : null;
 
     const wrapper = document.createElement('div');
     wrapper.className = 'peel-card';
 
     const face = document.createElement('div');
-    face.className = 'peel-face ' + SUIT_CLASS[suit];
-    face.innerHTML = `<span class="rank">${rank}</span><span class="suit">${SUIT_SYMBOL[suit]}</span>`;
+    face.className = 'peel-face' + (suit ? ' ' + SUIT_CLASS[suit] : '');
+    face.innerHTML = suit
+      ? `<span class="rank">${rank}</span><span class="suit">${SUIT_SYMBOL[suit]}</span>`
+      : `<span class="rank">?</span>`;
 
     const back = document.createElement('div');
     back.className = 'peel-back';
@@ -813,5 +860,570 @@
 
     setProgress(0);
     return wrapper;
+  }
+
+  // =======================================================================
+  // MULTIPLAYER — a real room on the server (lib/rooms.js via the /api/rooms/*
+  // endpoints in server.js), so a link can actually be shared: each seat is a different
+  // browser/device, your own 7 cards stay secret from everyone else until the whole table
+  // is ready (then hands are "tabled" — shown to everyone, like a real sweat — and the
+  // board reveal that follows is driven by the host and mirrored to every other viewer).
+  //
+  // The host's own reveal clicks update local state immediately (so the host's UI never
+  // waits on its own round-trip), and a single poll loop keeps everyone (host included, for
+  // seat-list/presence and as a safety net) in sync the rest of the time. A small monotonic
+  // guard (sweatKeyFor + "never apply a stageIndex that's older than what we've already
+  // shown") stops a slow/late poll response from ever visually rolling the reveal backwards.
+  // =======================================================================
+  const MP_SESSION_KEY = 'sweat-room-mp-session';
+  const MP_POLL_MS = 1200;
+  const MP_STAGE_LABEL = {
+    flops: 'both flops',
+    turnA: 'the Board A turn',
+    turnB: 'the Board B turn',
+    riverA: 'the Board A river',
+    riverB: 'the Board B river'
+  };
+
+  const mp = {
+    code: null,
+    playerId: null,
+    hand: null,            // this browser's own 7 dealt cards (never anyone else's)
+    assignment: null,      // { one:[], two:[], four:[] } — local until "I'm Ready" submits it
+    selectedCard: null,
+    arrangingInitialized: false,
+    enteredSweat: false,
+    lastAppliedSweatKey: null,
+    lastRoom: null,
+    pollTimer: null
+  };
+
+  async function mpApi(method, path, body) {
+    try {
+      const res = await fetch(path, {
+        method,
+        headers: body !== undefined ? { 'Content-Type': 'application/json' } : undefined,
+        body: body !== undefined ? JSON.stringify(body) : undefined
+      });
+      const json = await res.json().catch(() => ({}));
+      if (!res.ok) return { error: (json && json.error) || `Request failed (${res.status}).` };
+      return json;
+    } catch (e) {
+      return { error: 'Could not reach the server — check your connection and try again.' };
+    }
+  }
+
+  function sweatKeyFor(room) {
+    return [
+      room.stageIndex,
+      room.revealedA,
+      room.revealedB,
+      room.pendingSwing ? room.pendingSwing.boardIndex + ':' + room.pendingSwing.hasSwing : 'none'
+    ].join('|');
+  }
+
+  function startMpPolling() {
+    stopMpPolling();
+    mp.pollTimer = setInterval(async () => {
+      if (!mp.code || !mp.playerId) return;
+      const resp = await mpApi('GET', `/api/rooms/${mp.code}?playerId=${encodeURIComponent(mp.playerId)}`);
+      if (resp.error) return; // transient network hiccup — just try again next tick
+      handleMpRoomUpdate(resp.room);
+    }, MP_POLL_MS);
+  }
+  function stopMpPolling() {
+    if (mp.pollTimer) { clearInterval(mp.pollTimer); mp.pollTimer = null; }
+  }
+
+  function showMpScreenPanel(which) {
+    if (which === 'sweat') {
+      hide('mpScreen');
+      show('sweatScreen');
+      return;
+    }
+    hide('sweatScreen');
+    show('mpScreen');
+    el('mpEntryPanel').classList.add('hidden');
+    el('mpLobbyPanel').classList.toggle('hidden', which !== 'lobby');
+    el('mpArrangePanel').classList.toggle('hidden', which !== 'arranging');
+  }
+
+  // The single dispatcher every room update (the host's own action responses, and every
+  // poll tick for everyone) runs through — keeps the lobby/arranging/sweat screens in sync
+  // with whatever the server says is actually true.
+  function handleMpRoomUpdate(room) {
+    mp.lastRoom = room;
+
+    if (room.phase === 'lobby') {
+      mp.arrangingInitialized = false;
+      mp.enteredSweat = false;
+      mp.lastAppliedSweatKey = null;
+      showMpScreenPanel('lobby');
+      renderMpLobby(room);
+      return;
+    }
+
+    if (room.phase === 'arranging') {
+      mp.enteredSweat = false;
+      mp.lastAppliedSweatKey = null;
+      showMpScreenPanel('arranging');
+      if (!mp.arrangingInitialized) {
+        mp.arrangingInitialized = true;
+        mp.hand = room.yourHand || mp.hand || [];
+        mp.assignment = { one: [], two: [], four: [] };
+        mp.selectedCard = null;
+        renderMpArranger();
+      }
+      renderMpArrangeStatus(room);
+      return;
+    }
+
+    if (room.phase === 'sweat') {
+      if (!mp.enteredSweat) {
+        mp.enteredSweat = true;
+        showMpScreenPanel('sweat');
+      }
+      const regressing = sweat.mode === 'mp' && sweat.mpCode === room.code && room.stageIndex < sweat.stageIndex;
+      const key = sweatKeyFor(room);
+      if (!regressing && key !== mp.lastAppliedSweatKey) {
+        mp.lastAppliedSweatKey = key;
+        applyRoomToSweat(room);
+        renderBoards();
+        renderStage();
+        recomputeStanding();
+      }
+    }
+  }
+
+  function applyRoomToSweat(room) {
+    sweat.mode = 'mp';
+    sweat.mpCode = room.code;
+    sweat.mpIsHost = room.isHost;
+    sweat.mpHostId = room.hostId;
+    sweat.homerunMode = room.homerunMode;
+    sweat.players = room.players.map((p) => ({ id: p.id, name: p.name, assignment: p.assignment }));
+    sweat.boardA = room.boardA;
+    sweat.boardB = room.boardB;
+    sweat.revealedA = room.revealedA;
+    sweat.revealedB = room.revealedB;
+    sweat.stageIndex = room.stageIndex;
+    sweat.pendingSwing = room.pendingSwing;
+    syncNewHandButtonVisibility();
+  }
+
+  // ---------------------------------------------------------------------
+  // Lobby (room code, share link, seat list, host-only Deal button)
+  // ---------------------------------------------------------------------
+  function renderMpLobby(room) {
+    el('mpRoomCodeLabel').textContent = room.code;
+    el('mpRoomCode').textContent = room.code;
+    el('mpShareLink').value = location.origin + location.pathname + '?room=' + room.code;
+
+    const seatWrap = el('mpSeatList');
+    seatWrap.innerHTML = '';
+    room.players.forEach((p) => {
+      const tag = document.createElement('div');
+      tag.className = 'player-tab static';
+      tag.innerHTML = `<span class="seat-dot ${p.connected ? 'connected' : ''}"></span>${escapeHtml(p.name)}`
+        + (p.isHost ? '<span class="host-badge">HOST</span>' : '');
+      seatWrap.appendChild(tag);
+    });
+    for (let i = room.players.length; i < room.capacity; i++) {
+      const tag = document.createElement('div');
+      tag.className = 'player-tab static';
+      tag.style.opacity = '0.45';
+      tag.textContent = 'Waiting for a player…';
+      seatWrap.appendChild(tag);
+    }
+
+    const full = room.players.length === room.capacity;
+    if (room.isHost) {
+      el('btnMpDeal').classList.remove('hidden');
+      el('btnMpDeal').disabled = !full;
+      el('mpLobbyStatus').textContent = full
+        ? "Everyone's here — deal when ready."
+        : `Waiting for ${room.capacity - room.players.length} more player(s) to join…`;
+    } else {
+      el('btnMpDeal').classList.add('hidden');
+      el('mpLobbyStatus').textContent = full
+        ? 'Waiting for the host to deal…'
+        : `Waiting for ${room.capacity - room.players.length} more player(s) to join…`;
+    }
+  }
+
+  // ---------------------------------------------------------------------
+  // Arranging your own single hand (same click-card-then-click-slot model as solo/reference)
+  // ---------------------------------------------------------------------
+  function mpTrayCards() {
+    const used = new Set([...mp.assignment.one, ...mp.assignment.two, ...mp.assignment.four]);
+    return sortCards(mp.hand.filter((c) => !used.has(c)), cardSortMode);
+  }
+
+  function updateMpReadyButton() {
+    el('btnMpReady').disabled = G.validateAssignment(mp.hand, mp.assignment) !== null;
+  }
+
+  function renderMpArrangeStatus(room) {
+    const readyCount = room.players.filter((p) => p.ready).length;
+    el('mpArrangeStatus').textContent = `${readyCount}/${room.players.length} players ready`;
+  }
+
+  function renderMpArranger() {
+    const asg = mp.assignment;
+    const wrap = document.createElement('div');
+
+    const slots = document.createElement('div');
+    slots.className = 'slots';
+    ZONES.forEach((zone) => {
+      const slotDiv = document.createElement('div');
+      slotDiv.className = 'slot';
+      slotDiv.dataset.slot = zone;
+
+      const title = document.createElement('div');
+      title.className = 'slot-title';
+      title.innerHTML = `${SLOT_TITLES[zone]} <span class="pt">worth ${G.POINTS[zone]} pt / board</span>`;
+      slotDiv.appendChild(title);
+
+      const cardsDiv = document.createElement('div');
+      cardsDiv.className = 'slot-cards';
+      asg[zone].forEach((c) => {
+        const node = cardEl(c);
+        node.addEventListener('click', (ev) => {
+          ev.stopPropagation();
+          asg[zone] = asg[zone].filter((x) => x !== c);
+          mp.selectedCard = null;
+          renderMpArranger();
+        });
+        cardsDiv.appendChild(node);
+      });
+      slotDiv.appendChild(cardsDiv);
+
+      slotDiv.addEventListener('click', () => {
+        if (!mp.selectedCard) return;
+        if (asg[zone].length >= CAPACITY[zone]) return;
+        asg[zone].push(mp.selectedCard);
+        mp.selectedCard = null;
+        renderMpArranger();
+      });
+
+      slots.appendChild(slotDiv);
+    });
+    wrap.appendChild(slots);
+
+    const trayWrap = document.createElement('div');
+    trayWrap.className = 'tray-wrap';
+
+    const trayTitleRow = document.createElement('div');
+    trayTitleRow.className = 'slot-title tray-title-row';
+    const trayLabel = document.createElement('span');
+    trayLabel.innerHTML = `Your Cards <span class="hint-inline">(click a card, then click a hand above &mdash; or &#8984;/Ctrl+click a card to drop it in the first open slot)</span>`;
+    trayTitleRow.appendChild(trayLabel);
+
+    const sortControl = document.createElement('span');
+    sortControl.className = 'sort-control';
+    const sortLabel = document.createElement('span');
+    sortLabel.className = 'sort-label';
+    sortLabel.textContent = 'Sort:';
+    sortControl.appendChild(sortLabel);
+    ['dealt', 'rank', 'suit'].forEach((mode) => {
+      const btn = document.createElement('button');
+      btn.type = 'button';
+      btn.className = 'sort-btn' + (cardSortMode === mode ? ' active' : '');
+      btn.textContent = mode[0].toUpperCase() + mode.slice(1);
+      btn.addEventListener('click', () => {
+        if (cardSortMode === mode) return;
+        cardSortMode = mode;
+        try { localStorage.setItem(CARD_SORT_KEY, cardSortMode); } catch (e) { /* ignore */ }
+        renderMpArranger();
+      });
+      sortControl.appendChild(btn);
+    });
+    trayTitleRow.appendChild(sortControl);
+    trayWrap.appendChild(trayTitleRow);
+
+    const tray = document.createElement('div');
+    tray.className = 'tray';
+    mpTrayCards().forEach((c) => {
+      const node = cardEl(c);
+      if (mp.selectedCard === c) node.classList.add('selected');
+      node.addEventListener('click', (ev) => {
+        if (ev.metaKey || ev.ctrlKey) {
+          placeInFirstOpenSlot(asg, c, CAPACITY);
+          mp.selectedCard = null;
+          renderMpArranger();
+          return;
+        }
+        mp.selectedCard = mp.selectedCard === c ? null : c;
+        renderMpArranger();
+      });
+      tray.appendChild(node);
+    });
+    trayWrap.appendChild(tray);
+    wrap.appendChild(trayWrap);
+
+    el('mpArrangerBody').innerHTML = '';
+    el('mpArrangerBody').appendChild(wrap);
+
+    updateMpReadyButton();
+  }
+
+  // ---------------------------------------------------------------------
+  // Sweat — host-only reveal controls (mirrors solo's, but talks to the server); everyone
+  // else sees a passive "waiting for the host" message plus whatever outs panel the host's
+  // river-swing check produced (identical for every viewer, since the server computed it
+  // once and broadcasts the same result to all of them).
+  // ---------------------------------------------------------------------
+  function showMpSweatError(msg) {
+    const div = document.createElement('div');
+    div.className = 'control-label';
+    div.style.color = 'var(--danger)';
+    div.textContent = msg;
+    el('revealControls').appendChild(div);
+  }
+
+  function renderGuestWaiting(stageId) {
+    el('revealControls').innerHTML = '';
+    const block = document.createElement('div');
+    block.className = 'control-block';
+    const label = document.createElement('div');
+    label.className = 'control-label';
+    if (stageId === 'done') {
+      label.textContent = '🏁 Showdown complete';
+    } else {
+      const hostPlayer = sweat.players.find((p) => p.id === sweat.mpHostId);
+      const hostName = hostPlayer ? hostPlayer.name : 'the host';
+      label.textContent = `Waiting for ${hostName} to reveal ${MP_STAGE_LABEL[stageId] || 'the next card'}…`;
+    }
+    block.appendChild(label);
+    el('revealControls').appendChild(block);
+    renderOutsPanel(sweat.pendingSwing);
+  }
+
+  function renderFlopsControlMp() {
+    el('revealControls').innerHTML = '';
+    const block = document.createElement('div');
+    block.className = 'control-block';
+    const label = document.createElement('div');
+    label.className = 'control-label';
+    label.textContent = 'Both flops, revealed together';
+    const btn = document.createElement('button');
+    btn.type = 'button';
+    btn.className = 'primary';
+    btn.style.width = 'auto';
+    btn.textContent = 'Reveal Both Flops';
+    btn.addEventListener('click', async () => {
+      btn.disabled = true;
+      const resp = await mpApi('POST', `/api/rooms/${mp.code}/advance`, { playerId: mp.playerId, action: 'flops' });
+      if (resp.error) { showMpSweatError(resp.error); btn.disabled = false; return; }
+      mp.lastAppliedSweatKey = sweatKeyFor(resp.room);
+      applyRoomToSweat(resp.room);
+      renderBoards();
+      await recomputeStanding();
+      renderStage();
+    });
+    block.appendChild(label);
+    block.appendChild(btn);
+    el('revealControls').appendChild(block);
+  }
+
+  function renderTurnControlMp(boardIndex) {
+    el('revealControls').innerHTML = '';
+    const block = document.createElement('div');
+    block.className = 'control-block';
+    const label = document.createElement('div');
+    label.className = 'control-label';
+    label.textContent = `Turn — Board ${boardIndex === 0 ? 'A' : 'B'}`;
+    const btn = document.createElement('button');
+    btn.type = 'button';
+    btn.className = 'reveal-card-btn';
+    btn.addEventListener('click', async () => {
+      btn.style.pointerEvents = 'none';
+      const action = boardIndex === 0 ? 'turnA' : 'turnB';
+      const resp = await mpApi('POST', `/api/rooms/${mp.code}/advance`, { playerId: mp.playerId, action });
+      if (resp.error) { showMpSweatError(resp.error); btn.style.pointerEvents = ''; return; }
+      mp.lastAppliedSweatKey = sweatKeyFor(resp.room);
+      applyRoomToSweat(resp.room);
+      renderBoards();
+      await recomputeStanding();
+      renderStage();
+    });
+    block.appendChild(label);
+    block.appendChild(btn);
+    el('revealControls').appendChild(block);
+  }
+
+  async function renderRiverStageMp(boardIndex) {
+    el('revealControls').innerHTML = `<div class="control-block"><div class="control-label">Checking the river for outs…</div></div>`;
+    const resp = await mpApi('POST', `/api/rooms/${mp.code}/river-swing`, { playerId: mp.playerId, board: boardIndex });
+    if (resp.error) { showMpSweatError(resp.error); return; }
+    applyRoomToSweat(resp.room);
+    renderOutsPanel(sweat.pendingSwing);
+    renderRiverControlMp(boardIndex, !!(sweat.pendingSwing && sweat.pendingSwing.hasSwing));
+  }
+
+  function completeRiverMp(boardIndex) {
+    return async () => {
+      el('outsPanel').classList.add('hidden');
+      const action = boardIndex === 0 ? 'riverA' : 'riverB';
+      const resp = await mpApi('POST', `/api/rooms/${mp.code}/advance`, { playerId: mp.playerId, action });
+      if (resp.error) { showMpSweatError(resp.error); return; }
+      mp.lastAppliedSweatKey = sweatKeyFor(resp.room);
+      applyRoomToSweat(resp.room);
+      renderBoards();
+      await recomputeStanding();
+      renderStage();
+    };
+  }
+
+  function renderRiverControlMp(boardIndex, hasSwing) {
+    el('revealControls').innerHTML = '';
+    const block = document.createElement('div');
+    block.className = 'control-block';
+    const label = document.createElement('div');
+    label.className = 'control-label';
+    label.textContent = hasSwing
+      ? `River — Board ${boardIndex === 0 ? 'A' : 'B'} — hold to peel`
+      : `River — Board ${boardIndex === 0 ? 'A' : 'B'}`;
+    block.appendChild(label);
+
+    if (hasSwing) {
+      // `card` is deliberately null here — the real value only exists once the server
+      // confirms the reveal (see createPeelCard's comment above).
+      block.appendChild(createPeelCard(null, completeRiverMp(boardIndex)));
+    } else {
+      const btn = document.createElement('button');
+      btn.type = 'button';
+      btn.className = 'reveal-card-btn';
+      btn.addEventListener('click', () => {
+        btn.style.pointerEvents = 'none';
+        completeRiverMp(boardIndex)();
+      });
+      block.appendChild(btn);
+    }
+    el('revealControls').appendChild(block);
+  }
+
+  function renderDoneStageMp() {
+    el('revealControls').innerHTML = `<div class="control-block"><div class="control-label">🏁 Showdown complete</div></div>`;
+  }
+
+  // ---------------------------------------------------------------------
+  // Entry: mode screen, create/join forms, lobby wiring
+  // ---------------------------------------------------------------------
+  el('btnModeSolo').addEventListener('click', () => {
+    hide('modeScreen');
+    show('setupScreen');
+  });
+  el('btnModeMultiplayer').addEventListener('click', () => {
+    hide('modeScreen');
+    show('mpScreen');
+  });
+
+  function setMpEntryTab(tab) {
+    el('mpEntryTabs').querySelectorAll('.pill-btn').forEach((b) => b.classList.toggle('active', b.dataset.tab === tab));
+    el('mpCreatePanel').classList.toggle('hidden', tab !== 'create');
+    el('mpJoinPanel').classList.toggle('hidden', tab !== 'join');
+    el('mpEntryError').textContent = '';
+  }
+  el('mpEntryTabs').querySelectorAll('.pill-btn').forEach((b) => {
+    b.addEventListener('click', () => setMpEntryTab(b.dataset.tab));
+  });
+  setMpEntryTab('create');
+
+  let mpCapacity = 2;
+  el('mpCapacityGroup').querySelectorAll('.pill-btn').forEach((btn) => {
+    btn.addEventListener('click', () => {
+      mpCapacity = Number(btn.dataset.count);
+      el('mpCapacityGroup').querySelectorAll('.pill-btn').forEach((b) => b.classList.toggle('active', Number(b.dataset.count) === mpCapacity));
+    });
+  });
+  el('mpCapacityGroup').querySelector('.pill-btn[data-count="2"]').classList.add('active');
+
+  function saveMpSession() {
+    try { localStorage.setItem(MP_SESSION_KEY, JSON.stringify({ code: mp.code, playerId: mp.playerId })); } catch (e) { /* ignore */ }
+  }
+
+  el('btnMpCreate').addEventListener('click', async () => {
+    const hostName = el('mpHostName').value.trim();
+    el('mpEntryError').textContent = '';
+    el('btnMpCreate').disabled = true;
+    const resp = await mpApi('POST', '/api/rooms', { hostName, capacity: mpCapacity, homerunMode: el('mpHomerunToggle').checked });
+    el('btnMpCreate').disabled = false;
+    if (resp.error) { el('mpEntryError').textContent = resp.error; return; }
+    mp.code = resp.room.code;
+    mp.playerId = resp.playerId;
+    saveMpSession();
+    handleMpRoomUpdate(resp.room);
+    startMpPolling();
+  });
+
+  el('btnMpJoin').addEventListener('click', async () => {
+    const name = el('mpJoinName').value.trim();
+    const code = el('mpJoinCode').value.trim().toUpperCase();
+    el('mpEntryError').textContent = '';
+    if (!code) { el('mpEntryError').textContent = 'Enter a room code.'; return; }
+    el('btnMpJoin').disabled = true;
+    const resp = await mpApi('POST', `/api/rooms/${code}/join`, { name });
+    el('btnMpJoin').disabled = false;
+    if (resp.error) { el('mpEntryError').textContent = resp.error; return; }
+    mp.code = resp.room.code;
+    mp.playerId = resp.playerId;
+    saveMpSession();
+    handleMpRoomUpdate(resp.room);
+    startMpPolling();
+  });
+
+  el('btnMpDeal').addEventListener('click', async () => {
+    el('btnMpDeal').disabled = true;
+    const resp = await mpApi('POST', `/api/rooms/${mp.code}/deal`, { playerId: mp.playerId });
+    if (resp.error) { el('mpLobbyStatus').textContent = resp.error; el('btnMpDeal').disabled = false; return; }
+    handleMpRoomUpdate(resp.room);
+  });
+
+  el('btnMpReady').addEventListener('click', async () => {
+    if (G.validateAssignment(mp.hand, mp.assignment) !== null) return;
+    el('btnMpReady').disabled = true;
+    const resp = await mpApi('POST', `/api/rooms/${mp.code}/submit`, { playerId: mp.playerId, assignment: mp.assignment });
+    if (resp.error) { el('mpArrangeStatus').textContent = resp.error; el('btnMpReady').disabled = false; return; }
+    el('mpArrangerBody').innerHTML = '<p class="hint">Waiting for the rest of the table…</p>';
+    handleMpRoomUpdate(resp.room);
+  });
+
+  el('btnMpCopyLink').addEventListener('click', async () => {
+    const link = el('mpShareLink').value;
+    try {
+      await navigator.clipboard.writeText(link);
+      const btn = el('btnMpCopyLink');
+      const original = btn.textContent;
+      btn.textContent = 'Copied!';
+      setTimeout(() => { btn.textContent = original; }, 1500);
+    } catch (e) {
+      el('mpShareLink').select();
+    }
+  });
+
+  // A shared link looks like /?room=AB3CD — land straight on the join form, prefilled.
+  // Otherwise, if this browser already has a saved seat (e.g. the page was reloaded
+  // mid-game), try to silently resume it instead of starting over at the mode screen.
+  const roomParamFromUrl = new URLSearchParams(location.search).get('room');
+  if (roomParamFromUrl) {
+    hide('modeScreen');
+    show('mpScreen');
+    setMpEntryTab('join');
+    el('mpJoinCode').value = roomParamFromUrl.toUpperCase();
+  } else {
+    (async function tryResumeMpSession() {
+      let saved = null;
+      try { saved = JSON.parse(localStorage.getItem(MP_SESSION_KEY) || 'null'); } catch (e) { /* ignore */ }
+      if (!saved || !saved.code || !saved.playerId) return;
+      const resp = await mpApi('GET', `/api/rooms/${saved.code}?playerId=${encodeURIComponent(saved.playerId)}`);
+      if (resp.error) { try { localStorage.removeItem(MP_SESSION_KEY); } catch (e) { /* ignore */ } return; }
+      mp.code = saved.code;
+      mp.playerId = saved.playerId;
+      hide('modeScreen');
+      show('mpScreen');
+      handleMpRoomUpdate(resp.room);
+      startMpPolling();
+    })();
   }
 })();

@@ -2,11 +2,11 @@
   "name": "sweat-room",
   "version": "1.0.0",
   "private": true,
-  "description": "Set up a Taiwanese Poker hand for 2-4 players, then sweat it out card by card with live equity and a baccarat-style peel for swingy rivers.",
+  "description": "Set up a Taiwanese Poker hand for 2-4 players (solo or multiplayer over a shared link), then sweat it out card by card with live equity and a baccarat-style peel for swingy rivers.",
   "main": "server.js",
   "scripts": {
     "start": "node server.js",
-    "test": "node tests/game.test.js && node tests/equity.test.js && node tests/ui_sim.test.js"
+    "test": "node tests/game.test.js && node tests/equity.test.js && node tests/rooms_api.test.js && node tests/ui_sim.test.js && node tests/multiplayer_ui.test.js"
   },
   "devDependencies": {
     "jsdom": "^24.0.0"

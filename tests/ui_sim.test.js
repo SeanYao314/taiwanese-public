@@ -59,6 +59,13 @@ async function main() {
   const $$ = (sel) => Array.from(doc.querySelectorAll(sel));
   function click(el) { el.dispatchEvent(new w.Event('click', { bubbles: true })); }
 
+  // ---- mode screen: choose Solo ----
+  assert(!$('#modeScreen').classList.contains('hidden'), 'the mode screen (Solo vs Multiplayer) is shown first, before anything else');
+  assert($('#setupScreen').classList.contains('hidden'), 'the solo setup screen starts hidden until Solo is chosen');
+  click($('#btnModeSolo'));
+  assert($('#modeScreen').classList.contains('hidden'), 'choosing "Play Solo" hides the mode screen');
+  assert(!$('#setupScreen').classList.contains('hidden'), 'choosing "Play Solo" reveals the solo setup screen');
+
   // ---- setup screen: pick 3 players, deal ----
   const pill3 = $$('.pill-btn').find((b) => b.dataset.count === '3');
   click(pill3);

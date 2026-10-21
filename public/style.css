@@ -463,6 +463,20 @@ button.primary:hover:not(:disabled) { filter: brightness(1.08); }
 @keyframes ptsFlash { 0% { transform: scale(1.5); } 100% { transform: scale(1); } }
 .cell-points.flash { animation: ptsFlash .45s ease-out; }
 
+/* ---------- multiplayer: entry tabs, lobby seat list, waiting states ---------- */
+.player-tab.static { cursor: default; }
+.player-tab.static:hover { transform: none; }
+.player-tab .seat-dot {
+  width: 8px; height: 8px; border-radius: 50%;
+  background: #c9ccd1; display: inline-block; margin-right: 2px;
+}
+.player-tab .seat-dot.connected { background: #3bbf6e; }
+.player-tab .host-badge {
+  font-size: .65rem; font-weight: 800; color: var(--accent-dark);
+  background: rgba(212,175,55,0.18); padding: 1px 6px; border-radius: 999px; margin-left: 2px;
+}
+#mpEntryError:empty { display: none; }
+
 @media (max-width: 640px) {
   .slots { grid-template-columns: 1fr; }
   .cat-row { grid-template-columns: 1fr; }

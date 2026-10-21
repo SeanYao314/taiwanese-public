@@ -1,9 +1,11 @@
 # Sweat Room
 
-A standalone hot-seat app for setting up a Taiwanese Poker hand for 2-4 players and then
-sweating it out, card by card, with live equity and a baccarat-style peel for rivers that
-can really swing the hand. There's no "Practice" mode here on purpose — this tool is only
-about building one hand and sweating the result.
+An app for setting up a Taiwanese Poker hand for 2-4 players and then sweating it out, card
+by card, with live equity and a baccarat-style peel for rivers that can really swing the
+hand. There's no "Practice" mode here on purpose — this tool is only about building one hand
+and sweating the result. It can be played two ways: **Solo** (one browser arranges every
+seat, hot-seat style) or **Multiplayer** (create a room, send the link, and everyone arranges
+their own hand privately on their own device before sweating the board together).
 
 The look and the arranging/results interactions deliberately match the sibling Taiwanese
 Poker project (same light felt-and-gold theme, 4-color deck, click-card-then-click-slot
@@ -17,8 +19,33 @@ staged card-by-card reveal with live equity, and the river swing/outs/peel mecha
 node server.js
 ```
 
-Then open `http://localhost:3400/` (set `PORT` to use a different port). No dependencies,
-no build step — just a zero-dependency Node `http` server and a handful of plain files.
+Then open `http://localhost:3400/` (set `PORT` to use a different port). The static site has
+no dependencies and no build step; the server itself is still a plain Node `http` server with
+no third-party packages — the multiplayer room API below is just a few extra JSON routes on
+the same server, backed by an in-memory room store (`lib/rooms.js`). For someone else to join
+a room over the internet (not just on your LAN), the machine running `node server.js` needs
+to actually be reachable at whatever address you share — this repo doesn't include any
+tunneling/hosting setup, so pick a host (or a tool like `ngrok`) that gets you a public URL
+pointing at this server if you want to play with people who aren't on your network.
+
+## Solo vs. Multiplayer
+
+The very first screen asks which one you want:
+
+- **Solo** — unchanged from before: one browser deals and arranges every seat, then sweats
+  the result on that same screen. Good for building a specific hand to study, or for a group
+  physically looking at one screen together.
+- **Multiplayer** — create a room (pick 2-4 players, your name, and whether the Homerun bonus
+  is on) and you'll get a room code and a shareable link (`/?room=ABCDE`). Anyone who opens
+  that link lands straight on a "join this room" form. Once every seat is filled, the host
+  deals, and **each player then arranges only their own 7 cards, privately** — nobody,
+  including the host, can see another seat's split until every seat has clicked **I'm Ready**.
+  The instant the last player readies up, every hand is "tabled" (shown to the whole table,
+  like a real sweat) and the board reveal begins. From there, the **host controls the reveal**
+  (flop/turn/river buttons, and the hold-to-peel for swingy rivers) and everyone else's screen
+  mirrors it live — same boards, same multiway scoreboard, same outs panel, all driven by the
+  server rather than guessed independently by each browser. Reloading the page mid-game
+  resumes your seat automatically (your room + seat are remembered in `localStorage`).
 
 ## The rules
 
@@ -37,7 +64,7 @@ loses the same amount; ties award nothing). With the optional **Homerun bonus** 
 sweeping all 6 comparisons against one specific opponent (no ties anywhere) doubles the
 entire match total for that pairing (12 points swapped becomes 24).
 
-## Setting up a hand
+## Setting up a hand (Solo)
 
 1. Pick 2, 3, or 4 players and name them.
 2. Click **Deal Hands** — everyone gets 7 random cards, and both boards are dealt in full
@@ -73,6 +100,19 @@ hand) shows "needs more board cards…" until it's resolved. Underneath each pla
 a secondary line shows the probabilistic side of things — win% and projected finish — fading
 away once the hand is fully determined. Once both rivers are in, a sorted scoreboard and a
 full comparison log (every one of the 3×2×(pairs of players) comparisons) appear underneath.
+
+### How this differs in Multiplayer
+
+The arranging step above is Solo-only (one browser arranging every seat on tabs). In a
+Multiplayer room, each player gets their own single-hand arranger screen (no tabs — just
+your own cards), and the **Deal Hands** / reveal-stage buttons only ever appear for the
+host; everyone else sees a plain "Waiting for &lt;host&gt; to reveal…" message and watches
+the same boards and multiway scoreboard update live. The server (not any one browser) is
+the authority on the deck, the boards, and who's revealed what — in particular, an
+unrevealed card's value is never sent to any browser at all (not even the host's), so there's
+nothing to find by poking at network traffic before the host actually reveals it; the
+hold-to-peel card plays out not knowing its own face until the hold completes and the server
+confirms the reveal.
 
 ### Exact math where it's cheap, sampling where it isn't
 
@@ -121,30 +161,42 @@ there. The suspense is real; the deck isn't being tampered with to make it drama
 lib/poker.js      — the 5-card hand evaluator (shared with the sibling Taiwanese Poker app)
 lib/game.js       — dealing, split validation, and the 1/2/4 × 2-board scoring engine
 lib/equity.js     — live win%/expected-points equity, and the river swing/outs check
+lib/rooms.js      — multiplayer: in-memory room store + the join/deal/submit/reveal flow
 public/           — the actual website (index.html, style.css, client.js)
-server.js         — zero-dependency static file server
-tests/            — Node test suites (game logic, equity math, and a jsdom UI simulation)
+server.js         — static file server + the /api/rooms/* multiplayer JSON API
+tests/            — Node test suites (see below)
 ```
 
-All three `lib/*.js` files are written UMD-style, so the exact same code runs under
-`node tests/*.test.js` and as plain `<script>` tags in the browser — no separate client and
-server implementations to keep in sync.
+`lib/poker.js`, `lib/game.js`, and `lib/equity.js` are written UMD-style, so the exact same
+code runs under `node tests/*.test.js` and as plain `<script>` tags in the browser — no
+separate client and server implementations to keep in sync. `lib/rooms.js` is Node-only (it's
+the multiplayer server's private state, never shipped to the browser) and isn't UMD-wrapped.
 
 ## Tests
 
 ```
 node tests/game.test.js
 node tests/equity.test.js
-npm install           # only needed once, for ui_sim.test.js's jsdom dependency
+node tests/rooms_api.test.js
+npm install           # only needed once, for the jsdom-based UI tests below
 node tests/ui_sim.test.js
+node tests/multiplayer_ui.test.js
 ```
 
-(`game.test.js` and `equity.test.js` are dependency-free; `ui_sim.test.js` is the only one
-that needs `npm install` first, since it drives a real DOM via `jsdom`.)
+`game.test.js`, `equity.test.js`, and `rooms_api.test.js` are dependency-free (the last one
+drives the real multiplayer server over real HTTP with Node's built-in `fetch`, as two
+separate simulated players, checking that hidden hands actually stay hidden over the wire and
+that host-only actions are rejected for everyone else). `ui_sim.test.js` and
+`multiplayer_ui.test.js` are the two that need `npm install` first, since they drive a real
+DOM via `jsdom` — this environment's browser-automation tool turned out to have its outbound
+networking blocked entirely (even plain navigation to `localhost` or `example.com` failed), so
+jsdom is what actually exercises the UI code end-to-end here.
 
-`ui_sim.test.js` drives the actual `public/index.html` + `client.js` through a full
-setup → arrange → sweat → showdown flow (including both the plain-reveal and the
-hold-to-peel paths) against a real headless DOM (via `jsdom`), rather than a browser —
-this environment's browser-automation tool turned out to have its outbound networking
-blocked entirely (even plain navigation to `localhost` or `example.com` failed), so the
-jsdom-based simulation is what actually exercises the UI code end-to-end here.
+`ui_sim.test.js` covers the Solo flow: mode screen → setup → arrange → sweat → showdown,
+including both the plain-reveal and hold-to-peel paths. `multiplayer_ui.test.js` is the
+sterner test — it spins up the real server and drives **two independent `jsdom` windows**
+(host + guest) against it over real HTTP, exactly like two different browsers on two
+different devices: creating a room, joining by code, dealing, each window arranging only its
+own hand, confirming the two hands are actually different and hidden from each other,
+readying up, and then watching the host's reveal clicks (including an outs/peel river)
+mirror live onto the guest's screen with identical board cards and identical final scores.
