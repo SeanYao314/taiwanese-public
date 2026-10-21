@@ -7,9 +7,11 @@
 <link rel="stylesheet" href="/style.css">
 </head>
 <body>
-  <header class="app-header">
-    <h1>Sweat Room</h1>
-    <p class="tagline">Set up a Taiwanese Poker hand, then sweat it out card by card.</p>
+  <header class="topbar">
+    <div>
+      <div class="brand">🂡 Sweat Room</div>
+      <p class="tagline">Set up a Taiwanese Poker hand, then sweat it out card by card.</p>
+    </div>
   </header>
 
   <main id="app">
@@ -17,11 +19,11 @@
     <!-- ===================== SETUP SCREEN ===================== -->
     <section id="setupScreen" class="screen">
 
-      <div id="preDealPanel" class="panel">
-        <h2>1. New hand</h2>
+      <div id="preDealPanel" class="card-panel">
+        <h2>New hand</h2>
 
         <div class="field-row">
-          <label>Players</label>
+          <label class="row-label">Players</label>
           <div class="pill-group" id="playerCountGroup">
             <button type="button" class="pill-btn" data-count="2">2</button>
             <button type="button" class="pill-btn" data-count="3">3</button>
@@ -29,32 +31,32 @@
           </div>
         </div>
 
-        <div class="field-row" id="playerNamesRow">
-          <label>Names</label>
+        <div class="field-row">
+          <label class="row-label">Names</label>
           <div id="playerNameInputs" class="name-inputs"></div>
         </div>
 
-        <div class="field-row">
-          <label class="checkbox-row">
-            <input type="checkbox" id="homerunToggle">
-            <span>Homerun bonus (sweeping all 6 comparisons against an opponent doubles that match's points)</span>
-          </label>
-        </div>
+        <label class="checkbox-label" style="margin-bottom: 4px;">
+          <input type="checkbox" id="homerunToggle">
+          <span>Homerun bonus <span class="hint-inline">(sweeping all 6 comparisons vs an opponent — both boards, all 3 hands, no ties — doubles that match's points, 12&rarr;24)</span></span>
+        </label>
 
-        <button type="button" id="btnDeal" class="primary-btn">Deal Hands</button>
+        <button type="button" id="btnDeal" class="primary" style="margin-top: 16px;">Deal Hands</button>
       </div>
 
-      <div id="arrangePanel" class="panel hidden">
-        <h2>2. Arrange every hand</h2>
-        <p class="hint">Split each player's 7 cards into a 1-card hand, a 2-card hand, and a 4-card PLO hand. Pick a category below, then tap cards to place or return them.</p>
+      <div id="arrangePanel" class="card-panel wide hidden">
+        <div class="game-header">
+          <h2>Arrange every hand</h2>
+        </div>
+        <p class="hint" style="margin-top: -6px;">You're setting up both sides — split each player's 7 cards into a 1-card, 2-card, and 4-card PLO hand (click a card, then click a hand below — or &#8984;/Ctrl+click a card to drop it in the first open slot).</p>
 
         <div class="player-tabs" id="playerTabs"></div>
 
         <div id="arrangerBody"></div>
 
-        <div class="arrange-actions">
-          <button type="button" id="btnRedeal" class="ghost-btn">Re-deal</button>
-          <button type="button" id="btnSweat" class="primary-btn" disabled>Sweat It Out</button>
+        <div class="actions">
+          <button type="button" id="btnRedeal" class="secondary">Re-deal</button>
+          <button type="button" id="btnSweat" class="primary" disabled>Sweat It Out</button>
         </div>
       </div>
 
@@ -62,30 +64,43 @@
 
     <!-- ===================== SWEAT SCREEN ===================== -->
     <section id="sweatScreen" class="screen hidden">
-
-      <div class="boards-row">
-        <div class="board-col">
-          <h3 class="board-title" id="boardATitle">Board A</h3>
-          <div class="board-cards" id="boardACards"></div>
+      <div class="card-panel wide">
+        <div class="game-header">
+          <h2>Sweating it out</h2>
+          <div class="actions" style="width:auto;">
+            <button type="button" id="btnNewHand" class="secondary">New Hand</button>
+          </div>
         </div>
-        <div class="board-col">
-          <h3 class="board-title" id="boardBTitle">Board B</h3>
-          <div class="board-cards" id="boardBCards"></div>
+
+        <div class="boards-row" id="boardsRow">
+          <div class="board-block">
+            <h4>Board A</h4>
+            <div class="board-cards" id="boardACards"></div>
+          </div>
+          <div class="board-block">
+            <h4>Board B</h4>
+            <div class="board-cards" id="boardBCards"></div>
+          </div>
+        </div>
+
+        <div class="reveal-controls" id="revealControls"></div>
+
+        <div id="outsPanel" class="outs-panel hidden"></div>
+
+        <div id="homerunBanner" class="homerun-banner hidden"></div>
+
+        <div id="resultsPlayers"></div>
+
+        <div id="showdownExtras" class="hidden">
+          <h3>Scoreboard</h3>
+          <table class="scoreboard" id="scoreboard"></table>
+
+          <details class="rules-box">
+            <summary>Full comparison log</summary>
+            <div id="comparisonLog"></div>
+          </details>
         </div>
       </div>
-
-      <div class="reveal-controls" id="revealControls"></div>
-
-      <div id="outsPanel" class="outs-panel hidden"></div>
-
-      <div class="equity-panel" id="equityPanel"></div>
-
-      <div class="hands-panel" id="handsPanel"></div>
-
-      <div class="sweat-actions">
-        <button type="button" id="btnNewHand" class="ghost-btn">New Hand</button>
-      </div>
-
     </section>
 
   </main>

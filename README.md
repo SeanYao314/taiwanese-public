@@ -5,6 +5,12 @@ sweating it out, card by card, with live equity and a baccarat-style peel for ri
 can really swing the hand. There's no "Practice" mode here on purpose — this tool is only
 about building one hand and sweating the result.
 
+The look and the arranging/results interactions deliberately match the sibling Taiwanese
+Poker project (same light felt-and-gold theme, 4-color deck, click-card-then-click-slot
+arranger, and per-player/per-category/per-board scoreboard), so switching between the two
+feels like one app family — Sweat Room just adds the you-arrange-both-sides setup, the
+staged card-by-card reveal with live equity, and the river swing/outs/peel mechanic on top.
+
 ## Running it
 
 ```
@@ -35,9 +41,13 @@ entire match total for that pairing (12 points swapped becomes 24).
 
 1. Pick 2, 3, or 4 players and name them.
 2. Click **Deal Hands** — everyone gets 7 random cards, and both boards are dealt in full
-   immediately (face down). You arrange every player's hand yourself, one tab at a time:
-   pick a category (1-Card / 2-Card / 4-Card PLO), then tap cards to place or return them.
-   A player's tab gets a checkmark once their split is complete and legal.
+   immediately (face down). You arrange every player's hand yourself, one tab at a time,
+   using the same click-a-card-then-click-a-box interaction as the sibling Taiwanese Poker
+   project: click a card in your tray to select it (it highlights), then click the 1-Card,
+   2-Card, or 4-Card PLO box to drop it there — or Cmd/Ctrl+click a tray card to send it
+   straight to the first open slot. Click a placed card to send it back to the tray. A
+   sort control (Dealt / Rank / Suit) above the tray remembers your preference between
+   hands. A player's tab gets a checkmark once their split is complete and legal.
 3. Once everyone's valid, **Sweat It Out** unlocks.
 
 ## The sweat
@@ -52,9 +62,17 @@ order:
 4. **River, Board A**
 5. **River, Board B**
 
-After every single reveal, the equity panel recomputes live: each player's win% (chance of
-finishing with the strictly-best point total, ties splitting the credit) and expected point
-total, plus a per-category breakdown (who's currently ahead on each of the 6 comparisons).
+After every single reveal, the results view recomputes live, in the same multiway-friendly
+scoreboard format as the sibling Taiwanese Poker project: each player gets a box showing
+their hole cards grouped by hand, and for each of the 3 categories × 2 boards, a cell
+showing their current best-hand category (with the cards it's using highlighted) and a
+running point total for that cell, summed across every opponent at the table — so it reads
+correctly whether it's heads-up or a full 4-player table. A cell that can't be evaluated yet
+(the 1-card hand needs the turn, not just the flop, to have enough cards to make a 5-card
+hand) shows "needs more board cards…" until it's resolved. Underneath each player's total,
+a secondary line shows the probabilistic side of things — win% and projected finish — fading
+away once the hand is fully determined. Once both rivers are in, a sorted scoreboard and a
+full comparison log (every one of the 3×2×(pairs of players) comparisons) appear underneath.
 
 ### Exact math where it's cheap, sampling where it isn't
 
