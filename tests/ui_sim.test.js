@@ -5,8 +5,9 @@
 // (if headless) DOM and event loop instead of hand-reading the code for bugs.
 //
 // This covers the rewritten UI: click-a-tray-card-then-click-a-slot arranging
-// (matching the reference Taiwanese Poker project), and the multiway-friendly
-// per-player/per-category/per-board results display driven by computeLiveSnapshot.
+// (matching the reference Taiwanese Poker project), the automatic (no-click)
+// flop/turn/river pacing, the side-by-side compare table with live per-category
+// win% badges, and the drag-based squeeze modal for swingy rivers.
 //
 // Run with: node tests/ui_sim.test.js
 'use strict';
@@ -43,6 +44,11 @@ async function main() {
   const w = dom.window;
   const consoleErrors = [];
   w.addEventListener('error', (e) => { consoleErrors.push(e.error ? (e.error.stack || e.error.message) : e.message); });
+
+  // Speed up the solo auto-pacing driver's timers (1000/2500ms -> 15ms) the same way the
+  // server's own tests do via SWEAT_ROOM_FAST_TIMERS — otherwise this test would take 10+
+  // real seconds per hand waiting out the dramatic pacing on purpose.
+  w.__SWEAT_ROOM_FAST_TIMERS__ = true;
 
   // Load the three UMD libs then the client script, in the same order index.html does.
   w.eval(pokerSrc);
@@ -143,122 +149,93 @@ async function main() {
   const rankBtn = sortBtns.find((b) => b.textContent === 'Rank');
   assert(!!rankBtn, 'a "Rank" sort button is present');
 
-  // ---- enter the sweat screen ----
+  // ---- enter the sweat screen — everything from here on paces itself automatically ----
   click($('#btnSweat'));
   await waitUntil(() => !$('#sweatScreen').classList.contains('hidden'));
   assert($('#setupScreen').classList.contains('hidden'), 'entering the sweat screen hides the setup screen');
   assert(!$('#sweatScreen').classList.contains('hidden'), 'entering the sweat screen un-hides the sweat screen');
   assert($$('#boardACards .card-back').length === 5 && $$('#boardBCards .card-back').length === 5,
     'both boards start fully face-down (5 backs each) before any reveal');
-  await waitUntil(() => $$('.player-result').length === 3);
-  assert($$('.player-result').length === 3, 'the multiway results panel shows one .player-result box per player (3 players)');
-  assert($$('.player-result .cat-row').length === 9, 'each of the 3 player boxes shows 3 category rows (3 players x 3 categories = 9)');
-  assert($$('.player-result .board-eval.cell-pos, .player-result .board-eval.cell-neg, .player-result .board-eval.cell-even').length === 0,
-    'before any board cards are known, no board-eval cell has a decided point class yet');
-  assert($$('.player-result .cat-name.pending').length > 0, 'before any cards are revealed, pending category cells say "needs more board cards…"');
+  await waitUntil(() => $$('.compare-player-head').length === 3);
+  assert($$('.compare-player-head').length === 3, 'the side-by-side compare table shows one column per player (3 players)');
+  assert($$('.compare-row').length === 6, 'the compare table shows 6 rows (3 categories x 2 boards)');
+  assert($$('.compare-cell').length === 18, 'the compare table shows one cell per player per row (3 players x 6 rows = 18)');
+  assert($$('.compare-cell.cell-pos, .compare-cell.cell-neg, .compare-cell.cell-even').length === 0,
+    'before any board cards are known, no compare cell has a decided point class yet');
+  assert($$('.cc-cat-name.pending').length > 0, 'before any cards are revealed, pending category cells say "pending…"');
+  assert($('#revealControls').textContent.includes('Dealing both flops'),
+    'the reveal area shows a passive "Dealing both flops…" status — nothing to click');
+  assert(!$('#revealControls button'), 'there is no reveal button anywhere — the flop is not clicked, it just happens');
 
-  // ---- stage 1: flops ----
-  // Each reveal control's click handler awaits the async equity recompute BEFORE advancing
-  // sweat.stageIndex and re-rendering the controls, so the control area can lag behind the
-  // board cards updating. Wait by reference ("the old control element is gone") rather than
-  // re-querying immediately, same pattern used below for the river stages.
-  let revealBtn = $('#revealControls button');
-  assert(!!revealBtn && revealBtn.textContent.includes('Reveal Both Flops'), 'the first reveal control is "Reveal Both Flops"');
-  const flopsBtnNode = revealBtn;
-  click(revealBtn);
+  // ---- stage 1: flops happen on their own ----
   await waitUntil(() => $$('#boardACards .playing-card').length === 3 && $$('#boardBCards .playing-card').length === 3);
   assert($$('#boardACards .playing-card').length === 3 && $$('#boardBCards .playing-card').length === 3,
-    'clicking "Reveal Both Flops" reveals exactly 3 cards on EACH board simultaneously');
+    'both flops reveal automatically — exactly 3 cards on EACH board, with no click');
   // the 2-card and 4-card categories are evaluable at the flop; the 1-card category is not yet
-  await waitUntil(() => $$('.player-result .cat-name.pending').length > 0 && $$('.player-result .cat-name').length > $$('.player-result .cat-name.pending').length);
-  const pendingAtFlop = $$('.player-result .cat-name.pending').length;
-  assert(pendingAtFlop > 0, 'at the flop, the 1-card hand category is still pending ("needs more board cards…") for every player/board cell');
-  assert($$('.player-result .cat-name').length - pendingAtFlop > 0, 'at the flop, the 2-card and 4-card PLO categories are already showing a resolved category name');
+  await waitUntil(() => $$('.cc-cat-name.pending').length > 0 && $$('.cc-cat-name').length > $$('.cc-cat-name.pending').length);
+  const pendingAtFlop = $$('.cc-cat-name.pending').length;
+  assert(pendingAtFlop > 0, 'at the flop, the 1-card hand category is still pending ("pending…") for every player/board cell');
+  assert($$('.cc-cat-name').length - pendingAtFlop > 0, 'at the flop, the 2-card and 4-card PLO categories are already showing a resolved category name');
 
-  // ---- stage 2 & 3: turns ----
-  await waitUntil(() => !doc.contains(flopsBtnNode) && !!$('#revealControls .reveal-card-btn'));
-  revealBtn = $('#revealControls .reveal-card-btn');
-  assert(revealBtn.className.includes('reveal-card-btn'), 'after the flops, the next control is a plain reveal button (turn A)');
-  const turnABtnNode = revealBtn;
-  click(revealBtn);
+  // ---- the headline feature: a live win% badge even on a PENDING cell (the 1-card hand,
+  // which can't be named as a hand yet at the flop, but still has a meaningful win%) ----
+  await waitUntil(() => /^\d+%$/.test((doc.getElementById('pctBadge-p0-one-0') || {}).textContent || ''));
+  assert(/^\d+%$/.test(doc.getElementById('pctBadge-p0-one-0').textContent),
+    'the 1-card hand on Board A shows a live win% badge at the flop, even though the category itself is still pending');
+  assert(/^\d+%$/.test(doc.getElementById('pctBadge-p0-two-0').textContent),
+    'an already-resolved category (2-card hand) also shows a win% badge, for consistency');
+
+  // ---- stage 2 & 3: turns happen on their own ----
   await waitUntil(() => $$('#boardACards .playing-card').length === 4);
-  assert($$('#boardACards .playing-card').length === 4, 'turn A reveal brings board A up to 4 known cards');
-
-  await waitUntil(() => !doc.contains(turnABtnNode) && !!$('#revealControls .reveal-card-btn'));
-  revealBtn = $('#revealControls .reveal-card-btn');
-  const turnBBtnNode = revealBtn;
-  click(revealBtn);
+  assert($$('#boardACards .playing-card').length === 4, 'turn A reveals automatically, bringing board A up to 4 known cards');
   await waitUntil(() => $$('#boardBCards .playing-card').length === 4);
-  assert($$('#boardBCards .playing-card').length === 4, 'turn B reveal brings board B up to 4 known cards');
+  assert($$('#boardBCards .playing-card').length === 4, 'turn B reveals automatically, bringing board B up to 4 known cards');
   // once both boards reach the turn (4 known cards each), the 1-card category becomes evaluable everywhere
-  await waitUntil(() => $$('.player-result .cat-name.pending').length === 0);
-  assert($$('.player-result .cat-name.pending').length === 0, 'once both boards reach the turn, no category cell is pending any more (the 1-card hand is now evaluable too)');
+  await waitUntil(() => $$('.cc-cat-name.pending').length === 0);
+  assert($$('.cc-cat-name.pending').length === 0, 'once both boards reach the turn, no category cell is pending any more (the 1-card hand is now evaluable too)');
 
-  // ---- stage 4: river A (swing check happens first) ----
-  // The swing check (computeRiverSwing) can resolve purely on microtasks when its candidate
-  // pool is small, with no macrotask gap at all — so polling for a transient "checking..."
-  // message is unreliable (it can appear and clear within a single macrotask turn, before any
-  // setTimeout-based poll ever observes it). Instead, confirm we've moved past the PREVIOUS
-  // stage's button by reference (not just by CSS class, since the new button has the same
-  // class) before trusting whatever reveal-card-btn / peel-card we find next.
-  await waitUntil(() => !doc.contains(revealBtn) && (!!$('.peel-card') || !!$('#revealControls .reveal-card-btn')));
-  const hasPeel = !!$('.peel-card');
-  const hasPlainRiverBtn = !!$('#revealControls .reveal-card-btn');
-  assert(hasPeel || hasPlainRiverBtn, 'river A renders either a peel-card (swing) or a plain reveal button (no swing), never neither');
-  console.log('river A control type:', hasPeel ? 'peel (swing detected)' : 'plain button (no swing)');
-
-  let riverAControlNode; // whichever element river A's control turns out to be, used below to
-  // detect "we've moved past this" the same reference-based way, instead of racing a transient
-  // status message.
-  if (hasPeel) {
-    const peel = $('.peel-card');
-    riverAControlNode = peel;
-    assert(!$('#outsPanel').classList.contains('hidden'), 'when a peel card is shown for a swingy river, the outs panel is visible');
+  // ---- stage 4: river A — either auto-completes (no swing) or needs a squeeze (swing) ----
+  await waitUntil(() => $$('#boardACards .playing-card').length === 5 || !!$('.squeeze-trigger'));
+  const triggerA = $('.squeeze-trigger');
+  if (triggerA) {
+    console.log('river A control type: squeeze (swing detected)');
+    assert(!$('#outsPanel').classList.contains('hidden'), 'when a swing is detected on river A, the outs panel is visible');
     assert($$('#outsPanel .out-chip').length > 0, 'the outs panel lists at least one out chip when a swing is detected');
-    // simulate a full hold-to-peel: pointerdown, wait past the reveal duration, then release
-    peel.dispatchEvent(new w.PointerEvent('pointerdown', { bubbles: true, pointerId: 1 }));
-    await waitUntil(() => peel.classList.contains('locked'), { timeout: 4000 });
-    assert(peel.classList.contains('locked'), 'holding the peel card past its full duration locks it revealed');
+    await squeezeFully(triggerA, 1);
     await waitUntil(() => $$('#boardACards .playing-card').length === 5);
-    assert($$('#boardACards .playing-card').length === 5, 'completing the peel on river A reveals the 5th board-A card in the board display');
+    assert($$('#boardACards .playing-card').length === 5, 'completing the squeeze on river A reveals the 5th board-A card in the board display');
     assert($('#outsPanel').classList.contains('hidden'), 'the outs panel hides again once the swingy river is fully revealed');
   } else {
-    // snap-back check: press and release early, card must NOT reveal
-    const btn = $('#revealControls .reveal-card-btn');
-    riverAControlNode = btn;
+    console.log('river A control type: automatic (no swing detected)');
     assert($('#outsPanel').classList.contains('hidden'), 'when no swing is detected on river A, the outs panel stays hidden');
-    click(btn);
-    await waitUntil(() => $$('#boardACards .playing-card').length === 5);
-    assert($$('#boardACards .playing-card').length === 5, 'clicking the plain reveal button reveals the 5th board-A card');
+    assert($$('#boardACards .playing-card').length === 5, 'river A revealed itself automatically with no swing and nothing to click');
   }
 
   // ---- stage 5: river B ----
-  await waitUntil(() => !doc.contains(riverAControlNode) && (!!$('.peel-card') || !!$('#revealControls .reveal-card-btn')));
-  const hasPeelB = !!$('.peel-card');
-  const hasPlainBtnB = !!$('#revealControls .reveal-card-btn');
-  assert(hasPeelB || hasPlainBtnB, 'river B also renders either a peel-card or a plain reveal button');
-  console.log('river B control type:', hasPeelB ? 'peel (swing detected)' : 'plain button (no swing)');
-
-  if (hasPeelB) {
-    const peelB = $('.peel-card');
-    // this time, release EARLY and confirm it snaps back (does not lock, does not reveal)
-    peelB.dispatchEvent(new w.PointerEvent('pointerdown', { bubbles: true, pointerId: 2 }));
-    await sleep(200);
-    peelB.dispatchEvent(new w.PointerEvent('pointerup', { bubbles: true, pointerId: 2 }));
-    await sleep(400); // snap-back animation is time-based (220ms), not state we can poll for completion of "nothing happening"
-    assert(!peelB.classList.contains('locked'), 'releasing the peel card early (before full duration) does NOT lock it revealed');
+  await waitUntil(() => $$('#boardBCards .playing-card').length === 5 || !!$('.squeeze-trigger'));
+  const triggerB = $('.squeeze-trigger');
+  if (triggerB) {
+    console.log('river B control type: squeeze (swing detected)');
+    // first: drag only partway and release early — must snap back, not complete
+    click(triggerB);
+    await waitUntil(() => !!$('.squeeze-card'));
+    const cardOuterEarly = $('.squeeze-card');
+    cardOuterEarly.dispatchEvent(new w.PointerEvent('pointerdown', { bubbles: true, pointerId: 2, clientX: 0 }));
+    w.dispatchEvent(new w.PointerEvent('pointermove', { clientX: 40 })); // well under the 150° lock angle
+    w.dispatchEvent(new w.PointerEvent('pointerup', { clientX: 40 }));
+    await sleep(60);
+    assert(!!$('.squeeze-overlay'), 'releasing the drag early (before the lock angle) does NOT complete the squeeze — the modal stays open');
     assert($$('#boardBCards .playing-card').length === 4, 'an early release leaves board B still at 4 known cards (river not actually revealed)');
-    // now hold it fully through to completion
-    peelB.dispatchEvent(new w.PointerEvent('pointerdown', { bubbles: true, pointerId: 3 }));
-    await waitUntil(() => peelB.classList.contains('locked'), { timeout: 4000 });
-    assert(peelB.classList.contains('locked'), 'holding the peel card fully through now locks it revealed');
+    // now drag all the way through to completion
+    const cardOuterFull = $('.squeeze-card');
+    cardOuterFull.dispatchEvent(new w.PointerEvent('pointerdown', { bubbles: true, pointerId: 3, clientX: 0 }));
+    w.dispatchEvent(new w.PointerEvent('pointermove', { clientX: 300 }));
+    await waitUntil(() => !$('.squeeze-overlay'), { timeout: 2000 });
     await waitUntil(() => $$('#boardBCards .playing-card').length === 5);
-    assert($$('#boardBCards .playing-card').length === 5, 'completing the peel on river B reveals the 5th board-B card');
+    assert($$('#boardBCards .playing-card').length === 5, 'dragging the squeeze all the way through reveals the 5th board-B card');
   } else {
-    const btnB = $('#revealControls .reveal-card-btn');
-    click(btnB);
-    await waitUntil(() => $$('#boardBCards .playing-card').length === 5);
-    assert($$('#boardBCards .playing-card').length === 5, 'clicking the plain reveal button reveals the 5th board-B card');
+    console.log('river B control type: automatic (no swing detected)');
+    assert($$('#boardBCards .playing-card').length === 5, 'river B revealed itself automatically with no swing and nothing to click');
   }
 
   // ---- showdown: full multiway scoreboard + comparison log ----
@@ -268,8 +245,8 @@ async function main() {
   assert(!$('#showdownExtras').classList.contains('hidden'), 'the showdown extras panel (scoreboard + comparison log) appears once both rivers are fully revealed');
   assert($$('#scoreboard tr').length === 4, 'the scoreboard table has a header row plus one row per player (3 players + header = 4 rows)');
   assert($$('#comparisonLog > div').length === 18, 'the comparison log lists every comparison: 3 players choose 2 = 3 pairings x 3 categories x 2 boards = 18 lines');
-  assert($$('.player-result .cat-name.pending').length === 0, 'no category cell is pending any more once the showdown is complete');
-  const totalPoints = $$('.player-result .pscore').reduce((sum, el) => sum + parseInt(el.textContent, 10), 0);
+  assert($$('.cc-cat-name.pending').length === 0, 'no category cell is pending any more once the showdown is complete');
+  const totalPoints = $$('.compare-player-head .pscore').reduce((sum, el) => sum + parseInt(el.textContent, 10), 0);
   assert(totalPoints === 0, `the 3 players' final point totals are zero-sum (sum to 0), got ${totalPoints}`);
   assert(consoleErrors.length === 0, `no uncaught errors occurred at any point during the full setup->sweat->showdown flow, got: ${consoleErrors.join(' | ')}`);
 
@@ -281,6 +258,17 @@ async function main() {
 
   console.log(failures === 0 ? '\nALL TESTS PASSED' : `\n${failures} TEST(S) FAILED`);
   process.exit(failures === 0 ? 0 : 1);
+
+  // Clicks a squeeze trigger, waits for the modal, then drags it all the way through to
+  // completion in one go (used where the test doesn't care about the snap-back path).
+  async function squeezeFully(trigger, pointerId) {
+    click(trigger);
+    await waitUntil(() => !!$('.squeeze-card'));
+    const cardOuter = $('.squeeze-card');
+    cardOuter.dispatchEvent(new w.PointerEvent('pointerdown', { bubbles: true, pointerId, clientX: 0 }));
+    w.dispatchEvent(new w.PointerEvent('pointermove', { clientX: 300 }));
+    await waitUntil(() => !$('.squeeze-overlay'), { timeout: 2000 });
+  }
 }
 
 main().catch((e) => { console.error('FATAL', e); process.exit(1); });

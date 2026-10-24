@@ -2,8 +2,10 @@
 // Room. The static-file half is unchanged from before; the JSON API under /api/rooms/* is
 // what makes "send someone the link" actually work — it's a small in-memory room store
 // (lib/rooms.js) that keeps each player's dealt hand secret from the others until the whole
-// table is ready, then drives a shared, host-controlled board reveal that every connected
-// browser polls and mirrors.
+// table is ready, then paces the board reveal itself on its own clock (flop/turn/river, no
+// clicking) that every connected browser polls and mirrors. The one thing that still needs
+// a human is physically completing the squeeze on a river that turns out to be a swing spot
+// — the host does that, via POST .../advance.
 'use strict';
 const http = require('http');
 const fs = require('fs');
@@ -136,12 +138,6 @@ const server = http.createServer(async (req, res) => {
     if (action === 'advance' && method === 'POST') {
       const body = await readJSONBody(req).catch(() => ({}));
       await handleRoomAction(res, body.playerId, code, () => Rooms.advanceRoom(code, body.playerId, body.action));
-      return;
-    }
-
-    if (action === 'river-swing' && method === 'POST') {
-      const body = await readJSONBody(req).catch(() => ({}));
-      await handleRoomAction(res, body.playerId, code, () => Rooms.checkRiverSwing(code, body.playerId, body.board));
       return;
     }
 

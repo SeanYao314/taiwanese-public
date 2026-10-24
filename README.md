@@ -1,17 +1,23 @@
 # Sweat Room
 
 An app for setting up a Taiwanese Poker hand for 2-4 players and then sweating it out, card
-by card, with live equity and a baccarat-style peel for rivers that can really swing the
-hand. There's no "Practice" mode here on purpose — this tool is only about building one hand
-and sweating the result. It can be played two ways: **Solo** (one browser arranges every
-seat, hot-seat style) or **Multiplayer** (create a room, send the link, and everyone arranges
-their own hand privately on their own device before sweating the board together).
+by card, with a live side-by-side win% table and a baccarat/ClubGG-style drag-to-squeeze
+reveal for rivers that can really swing the hand. There's no "Practice" mode here on
+purpose — this tool is only about building one hand and sweating the result. It can be
+played two ways: **Solo** (one browser arranges every seat, hot-seat style) or
+**Multiplayer** (create a room, send the link, and everyone arranges their own hand
+privately on their own device before sweating the board together).
 
-The look and the arranging/results interactions deliberately match the sibling Taiwanese
-Poker project (same light felt-and-gold theme, 4-color deck, click-card-then-click-slot
-arranger, and per-player/per-category/per-board scoreboard), so switching between the two
-feels like one app family — Sweat Room just adds the you-arrange-both-sides setup, the
-staged card-by-card reveal with live equity, and the river swing/outs/peel mechanic on top.
+The look and the arranging interaction deliberately match the sibling Taiwanese Poker
+project (same light felt-and-gold theme, 4-color deck, click-card-then-click-slot arranger),
+so switching between the two feels like one app family — Sweat Room just adds the
+you-arrange-both-sides setup, the automatically-paced card-by-card reveal with live
+side-by-side equity, and the river swing/outs/squeeze mechanic on top.
+
+Nothing about the reveal is clicked through any more: once everyone's hand is arranged, the
+flop, both turns, and both rivers each reveal themselves on their own clock, with a
+deliberate pause at every stage for suspense. The *only* thing a person still ever does by
+hand is the squeeze — and only when a river actually turns out to swing the hand.
 
 ## Running it
 
@@ -41,11 +47,12 @@ The very first screen asks which one you want:
   deals, and **each player then arranges only their own 7 cards, privately** — nobody,
   including the host, can see another seat's split until every seat has clicked **I'm Ready**.
   The instant the last player readies up, every hand is "tabled" (shown to the whole table,
-  like a real sweat) and the board reveal begins. From there, the **host controls the reveal**
-  (flop/turn/river buttons, and the hold-to-peel for swingy rivers) and everyone else's screen
-  mirrors it live — same boards, same multiway scoreboard, same outs panel, all driven by the
-  server rather than guessed independently by each browser. Reloading the page mid-game
-  resumes your seat automatically (your room + seat are remembered in `localStorage`).
+  like a real sweat) and **the server itself starts pacing the board reveal** — flop, both
+  turns, both rivers — on its own clock, identically for every connected screen. Nobody
+  clicks anything to make that happen; the only time a person acts is when a river turns out
+  to be a swing spot, in which case the **host** (and only the host) physically completes the
+  squeeze, and everyone else watches it happen live. Reloading the page mid-game resumes your
+  seat automatically (your room + seat are remembered in `localStorage`).
 
 ## The rules
 
@@ -80,8 +87,9 @@ entire match total for that pairing (12 points swapped becomes 24).
 ## The sweat
 
 Both boards are already fully dealt behind the scenes the moment you clicked "Deal Hands"
-— the sweat screen just controls when each card gets shown. The reveal always goes in this
-order:
+— the sweat screen just controls when each card gets shown, and it controls that itself:
+there is nothing to click. The reveal always goes in this order, each stage sitting
+revealed for a couple of seconds before the next one starts, for a bit of dramatic pacing:
 
 1. **Both flops together** (3 cards on each board, revealed simultaneously)
 2. **Turn, Board A**
@@ -89,30 +97,33 @@ order:
 4. **River, Board A**
 5. **River, Board B**
 
-After every single reveal, the results view recomputes live, in the same multiway-friendly
-scoreboard format as the sibling Taiwanese Poker project: each player gets a box showing
-their hole cards grouped by hand, and for each of the 3 categories × 2 boards, a cell
-showing their current best-hand category (with the cards it's using highlighted) and a
-running point total for that cell, summed across every opponent at the table — so it reads
-correctly whether it's heads-up or a full 4-player table. A cell that can't be evaluated yet
-(the 1-card hand needs the turn, not just the flop, to have enough cards to make a 5-card
-hand) shows "needs more board cards…" until it's resolved. Underneath each player's total,
-a secondary line shows the probabilistic side of things — win% and projected finish — fading
-away once the hand is fully determined. Once both rivers are in, a sorted scoreboard and a
-full comparison log (every one of the 3×2×(pairs of players) comparisons) appear underneath.
+After every single reveal, the results view recomputes live into a **side-by-side compare
+table** — one column per player, one row per category × board (6 rows: 1-card/2-card/4-card
+PLO, each against Board A and Board B). Every cell shows that player's cards for that hand
+(with the ones used in their current best hand highlighted once resolved), their current
+category name, a running point total for that cell summed across every opponent at the
+table, and — this is the useful part — a **live win% badge for that specific cell**, even
+before the hand can be named. The 1-card hand's category can't actually be determined until
+the turn (a single card plus 4 known board cards isn't enough for a 5-card hand yet), but its
+win% is still meaningful at the flop already, so the badge shows a real, live-updating
+percentage there labeled "pending…" right next to it, instead of nothing at all. Once both
+rivers are in, a sorted scoreboard and a full comparison log (every one of the
+3×2×(pairs of players) comparisons) appear underneath.
 
 ### How this differs in Multiplayer
 
 The arranging step above is Solo-only (one browser arranging every seat on tabs). In a
 Multiplayer room, each player gets their own single-hand arranger screen (no tabs — just
-your own cards), and the **Deal Hands** / reveal-stage buttons only ever appear for the
-host; everyone else sees a plain "Waiting for &lt;host&gt; to reveal…" message and watches
-the same boards and multiway scoreboard update live. The server (not any one browser) is
-the authority on the deck, the boards, and who's revealed what — in particular, an
-unrevealed card's value is never sent to any browser at all (not even the host's), so there's
-nothing to find by poking at network traffic before the host actually reveals it; the
-hold-to-peel card plays out not knowing its own face until the hold completes and the server
-confirms the reveal.
+your own cards). Once everyone's ready, the **server** paces the reveal for every connected
+screen identically — nobody, host included, clicks anything to make the flop or a turn or a
+plain (non-swing) river happen. The server (not any one browser) is the authority on the
+deck, the boards, and how far the reveal has gotten — in particular, an unrevealed card's
+value is never sent to any browser at all (not even the host's), so there's nothing to find
+by poking at network traffic before it's actually revealed. The one exception: if a river
+turns out to be a swing spot, the server pauses there and waits — indefinitely — for the
+**host**, and only the host, to physically complete the squeeze (see below); everyone else's
+screen shows a "&lt;host&gt; is squeezing…" message and watches the outs panel and the
+eventual reveal mirror over live once the host finishes it.
 
 ### Exact math where it's cheap, sampling where it isn't
 
@@ -135,7 +146,7 @@ board's own pending river, if it hasn't been shown yet), so checking every possi
 of the pending river only ever needs to additionally average over one more unknown card at
 most, never two.
 
-### Outs and the peel
+### Outs and the squeeze
 
 Right before each river is revealed, Sweat Room checks every possible value that card could
 take and computes each player's expected points for that specific value, compared against
@@ -143,15 +154,21 @@ the average across all of them. If any player's expected points would swing by 5
 (the default threshold) depending on the river, that river is treated as a swing spot:
 
 - An **outs panel** appears, listing which specific cards would swing it and for whom.
-- The river is no longer a simple flip — it becomes a **hold-to-peel card**. Press and hold
-  to slowly lift the corner and reveal it top-to-bottom over about a second and a half.
-  Release early and it snaps back face-down, unrevealed. Hold it all the way and it locks in
-  revealed.
+- The river stops revealing itself automatically and instead waits for a **squeeze** —
+  baccarat/ClubGG style. A small face-down "Tap to squeeze" trigger appears; tapping it opens
+  a bigger card front-and-center. **Drag it** (not hold it — the reveal tracks how far you've
+  dragged, not how long) and it physically bends open: partway through, the card goes
+  edge-on, like you're peeking at its side before committing to look; keep dragging and the
+  true face swings into view. Release before you've dragged far enough and it springs back
+  face-down, unrevealed. Drag far enough (or release past that point) and it locks in
+  revealed. In Multiplayer, only the host ever does this — everyone else just watches it
+  happen on their own screen in real time once the host finishes.
 
-If a river *isn't* a swing spot, it's just a plain click-to-reveal card — no ceremony needed
-when nothing much is riding on it.
+If a river *isn't* a swing spot, there's no squeeze at all — it just reveals itself on the
+same automatic clock as everything else, no ceremony needed when nothing much is riding on
+it.
 
-The actual card you reveal was already dealt the moment you clicked "Deal Hands" — peeling
+The actual card you reveal was already dealt the moment you clicked "Deal Hands" — squeezing
 doesn't draw a new random card, it just controls when you see the one that was already
 there. The suspense is real; the deck isn't being tampered with to make it dramatic.
 
@@ -192,11 +209,16 @@ DOM via `jsdom` — this environment's browser-automation tool turned out to hav
 networking blocked entirely (even plain navigation to `localhost` or `example.com` failed), so
 jsdom is what actually exercises the UI code end-to-end here.
 
-`ui_sim.test.js` covers the Solo flow: mode screen → setup → arrange → sweat → showdown,
-including both the plain-reveal and hold-to-peel paths. `multiplayer_ui.test.js` is the
-sterner test — it spins up the real server and drives **two independent `jsdom` windows**
-(host + guest) against it over real HTTP, exactly like two different browsers on two
-different devices: creating a room, joining by code, dealing, each window arranging only its
-own hand, confirming the two hands are actually different and hidden from each other,
-readying up, and then watching the host's reveal clicks (including an outs/peel river)
+`ui_sim.test.js` covers the Solo flow: mode screen → setup → arrange → sweat (automatic
+flop/turn/river pacing, with no buttons to click) → showdown, including both the plain
+auto-reveal and drag-squeeze paths, and checks that the compare table's win% badges show up
+even on pending cells. Both suites speed up the normally multi-second reveal pacing via a
+`SWEAT_ROOM_FAST_TIMERS=1` env var (server-side, `lib/rooms.js`) and a matching
+`window.__SWEAT_ROOM_FAST_TIMERS__` flag (client-side), so a full hand takes milliseconds
+instead of real seconds to verify. `multiplayer_ui.test.js` is the sterner test — it spins up
+the real server and drives **two independent `jsdom` windows** (host + guest) against it
+over real HTTP, exactly like two different browsers on two different devices: creating a
+room, joining by code, dealing, each window arranging only its own hand, confirming the two
+hands are actually different and hidden from each other, readying up, and then watching the
+server's own automatic reveal (including an outs/squeeze river that only the host completes)
 mirror live onto the guest's screen with identical board cards and identical final scores.

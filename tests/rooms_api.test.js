@@ -4,7 +4,9 @@
 // request/response cycle a browser would drive, not just by calling lib/rooms.js functions
 // directly — in particular, it proves hidden information actually stays hidden across the
 // wire (one player's view of room state never contains another player's cards until hands
-// are tabled), and that host-only actions are rejected for non-host players.
+// are tabled), that the board reveal paces itself automatically with no client action, and
+// that the one remaining host-only action (completing the squeeze on a swing river) is
+// rejected for everyone else and for the wrong stage.
 // Run with: node tests/rooms_api.test.js
 'use strict';
 const path = require('path');
@@ -14,14 +16,26 @@ function assert(cond, msg) {
   if (!cond) { console.error('FAIL:', msg); failures++; } else { console.log('ok:', msg); }
 }
 
+function sleep(ms) { return new Promise((r) => setTimeout(r, ms)); }
+async function waitUntil(conditionFn, timeout = 5000) {
+  const start = Date.now();
+  while (!(await conditionFn())) {
+    if (Date.now() - start > timeout) throw new Error('waitUntil timed out after ' + timeout + 'ms');
+    await sleep(10);
+  }
+}
+
 async function main() {
   process.env.PORT = '0'; // let the OS pick a free port
+  // Shrinks the server's own auto-pacing hold times (1000/2500ms -> 15ms) so this test
+  // doesn't spend 10+ real seconds waiting out the dramatic pacing on purpose.
+  process.env.SWEAT_ROOM_FAST_TIMERS = '1';
   const server = require(path.join(__dirname, '..', 'server.js'));
   await new Promise((resolve) => server.once('listening', resolve)).catch(() => {});
   // server.js calls listen() synchronously at require time; if it's already listening by
   // the time we get here (likely, since require() is synchronous and listen() fires soon
   // after), the 'listening' event may have already fired — guard with a short wait instead.
-  await new Promise((r) => setTimeout(r, 50));
+  await sleep(50);
   const port = server.address().port;
   const base = `http://127.0.0.1:${port}`;
 
@@ -33,6 +47,9 @@ async function main() {
     });
     const json = await res.json().catch(() => null);
     return { status: res.status, json };
+  }
+  async function view(code, playerId) {
+    return (await api('GET', `/api/rooms/${code}?playerId=${playerId}`)).json.room;
   }
 
   // ---- create a 2-player room ----
@@ -103,7 +120,8 @@ async function main() {
   assert(hostPlayerInBobView.assignment === null, "the host's hand split stays hidden from Bob even after the host is ready, until EVERYONE is ready");
   assert(hostPlayerInBobView.ready === true, "Bob's view DOES show that the host has readied up (just not what they submitted)");
 
-  // ---- Bob submits; now both are ready, hands get tabled, sweat begins ----
+  // ---- Bob submits; now both are ready, hands get tabled, and the automatic reveal
+  // clock starts entirely on its own ----
   const bobHand = bobView.json.room.yourHand;
   const bobSplit = { one: [bobHand[0]], two: bobHand.slice(1, 3), four: bobHand.slice(3, 7) };
   const bobSubmit = await api('POST', `/api/rooms/${code}/submit`, { playerId: bobId, assignment: bobSplit });
@@ -114,49 +132,74 @@ async function main() {
   assert(bobSubmit.json.room.stage === 'flops', 'the sweat starts at the "flops" stage');
   assert(bobSubmit.json.room.boardA.length === 0 && bobSubmit.json.room.boardB.length === 0, 'no board cards are visible yet at the very start of the sweat');
 
-  // ---- non-host cannot advance the reveal ----
+  // ---- non-host can never call advance, even before anything is pending ----
   const nonHostAdvance = await api('POST', `/api/rooms/${code}/advance`, { playerId: bobId, action: 'flops' });
-  assert(nonHostAdvance.status === 403, 'a non-host player cannot advance the board reveal (403)');
+  assert(nonHostAdvance.status === 403, 'a non-host player cannot call advance (403)');
 
-  // ---- advancing out of order is rejected ----
-  const outOfOrder = await api('POST', `/api/rooms/${code}/advance`, { playerId: hostId, action: 'turnA' });
-  assert(outOfOrder.status === 409, 'trying to reveal a later stage before the current one is rejected (409)');
+  // ---- advance is rejected for a stage that reveals itself automatically ----
+  const autoStageAdvance = await api('POST', `/api/rooms/${code}/advance`, { playerId: hostId, action: 'flops' });
+  assert(autoStageAdvance.status === 409, 'advance is rejected for "flops" — it reveals itself automatically, there is nothing to complete (409)');
 
-  // ---- host advances through flops, turnA, turnB ----
-  const afterFlops = await api('POST', `/api/rooms/${code}/advance`, { playerId: hostId, action: 'flops' });
-  assert(afterFlops.status === 200 && afterFlops.json.room.boardA.length === 3 && afterFlops.json.room.boardB.length === 3,
-    'revealing "flops" shows exactly 3 cards on each board');
-  assert(afterFlops.json.room.stage === 'turnA', 'after the flops, the next stage is "turnA"');
+  // ---- the board reveals itself automatically: both flops, then both turns — no client
+  // action of any kind ----
+  await waitUntil(async () => {
+    const room = await view(code, hostId);
+    return room.boardA.length >= 3 && room.boardB.length >= 3;
+  });
+  let room = await view(code, hostId);
+  assert(room.boardA.length === 3 && room.boardB.length === 3, 'both flops reveal automatically to exactly 3 cards each, with no client action');
 
-  const afterTurnA = await api('POST', `/api/rooms/${code}/advance`, { playerId: hostId, action: 'turnA' });
-  assert(afterTurnA.json.room.boardA.length === 4, 'revealing "turnA" brings board A to 4 known cards');
+  await waitUntil(async () => (await view(code, hostId)).boardA.length >= 4);
+  await waitUntil(async () => (await view(code, hostId)).boardB.length >= 4);
+  room = await view(code, hostId);
+  assert(room.boardA.length === 4 && room.boardB.length === 4, 'both turns reveal automatically, bringing each board to 4 known cards');
 
-  const afterTurnB = await api('POST', `/api/rooms/${code}/advance`, { playerId: hostId, action: 'turnB' });
-  assert(afterTurnB.json.room.boardB.length === 4, 'revealing "turnB" brings board B to 4 known cards');
-  assert(afterTurnB.json.room.stage === 'riverA', 'after both turns, the next stage is "riverA"');
+  // Bob's own poll sees the identical, server-authoritative board.
+  const bobTurnView = await view(code, bobId);
+  assert(JSON.stringify(bobTurnView.boardA) === JSON.stringify(room.boardA) && JSON.stringify(bobTurnView.boardB) === JSON.stringify(room.boardB),
+    "Bob's poll sees the EXACT same board cards as the host's — one shared authoritative board");
 
-  // ---- river-swing check for board A (server-computed, same for every viewer) ----
-  const swingA = await api('POST', `/api/rooms/${code}/river-swing`, { playerId: hostId, board: 0 });
-  assert(swingA.status === 200, 'the host can request the river-A swing/outs check');
-  assert(typeof swingA.json.room.pendingSwing === 'object' && swingA.json.room.pendingSwing.boardIndex === 0,
-    'the swing check result is stored on the room as pendingSwing for board A');
-  const swingAForBob = await api('GET', `/api/rooms/${code}?playerId=${bobId}`);
-  assert(JSON.stringify(swingAForBob.json.room.pendingSwing) === JSON.stringify(swingA.json.room.pendingSwing),
-    "Bob's poll sees the EXACT SAME swing/outs result the host computed, not a separately-rolled one");
+  // ---- rivers: each one either completes itself automatically (no swing), or stops and
+  // waits — indefinitely — for the host to complete the squeeze (swing detected) ----
+  async function driveRiver() {
+    room = await view(code, hostId);
+    if (room.boardA.length === 5 && room.boardB.length === 5) return; // raced to 'done' already
+    // Track growth from THIS call's starting point, not an absolute "===5" — otherwise a
+    // board that already hit 5 on a PREVIOUS river (riverA) would make this call's wait for
+    // riverB resolve immediately, before riverB's own swing check has even run.
+    const beforeA = room.boardA.length;
+    const beforeB = room.boardB.length;
+    await waitUntil(async () => {
+      room = await view(code, hostId);
+      return room.boardA.length > beforeA || room.boardB.length > beforeB || (room.pendingSwing && room.pendingSwing.hasSwing);
+    });
+    if (!room.pendingSwing || !room.pendingSwing.hasSwing) return; // this river had no swing and auto-completed
+    const stage = room.stage; // 'riverA' or 'riverB'
+    const otherStage = stage === 'riverA' ? 'riverB' : 'riverA';
 
-  // ---- checking the swing for the wrong board/stage is rejected ----
-  const wrongBoardSwing = await api('POST', `/api/rooms/${code}/river-swing`, { playerId: hostId, board: 1 });
-  assert(wrongBoardSwing.status === 409, 'checking the river-B swing while still on the river-A stage is rejected (409)');
+    // Bob's poll sees the EXACT SAME swing/outs result the server computed once, not a
+    // separately-rolled one.
+    const bobDuringSwing = await view(code, bobId);
+    assert(JSON.stringify(bobDuringSwing.pendingSwing) === JSON.stringify(room.pendingSwing),
+      "Bob's poll sees the EXACT SAME swing/outs result the server computed, not a separately-rolled one");
 
-  // ---- complete both rivers ----
-  const afterRiverA = await api('POST', `/api/rooms/${code}/advance`, { playerId: hostId, action: 'riverA' });
-  assert(afterRiverA.json.room.boardA.length === 5, 'revealing "riverA" brings board A to its full 5 cards');
-  assert(afterRiverA.json.room.pendingSwing === null, 'completing the river clears the pending swing/outs info');
-  assert(afterRiverA.json.room.stage === 'riverB', 'after river A, the next stage is "riverB"');
+    const nonHostSqueeze = await api('POST', `/api/rooms/${code}/advance`, { playerId: bobId, action: stage });
+    assert(nonHostSqueeze.status === 403, `a non-host player cannot complete the squeeze on ${stage} (403)`);
 
-  const afterRiverB = await api('POST', `/api/rooms/${code}/advance`, { playerId: hostId, action: 'riverB' });
-  assert(afterRiverB.json.room.boardB.length === 5, 'revealing "riverB" brings board B to its full 5 cards');
-  assert(afterRiverB.json.room.stage === 'done', 'after both rivers, the stage is "done"');
+    const wrongStageSqueeze = await api('POST', `/api/rooms/${code}/advance`, { playerId: hostId, action: otherStage });
+    assert(wrongStageSqueeze.status === 409, `completing the squeeze for ${otherStage} while actually on ${stage} is rejected (409)`);
+
+    const squeeze = await api('POST', `/api/rooms/${code}/advance`, { playerId: hostId, action: stage });
+    assert(squeeze.status === 200, `the host can complete the squeeze on ${stage}`);
+    assert(squeeze.json.room.pendingSwing === null, 'completing the squeeze clears the pending swing/outs info');
+  }
+  await driveRiver();
+  await driveRiver();
+
+  await waitUntil(async () => (await view(code, hostId)).stage === 'done');
+  room = await view(code, hostId);
+  assert(room.boardA.length === 5 && room.boardB.length === 5, 'both rivers end up fully revealed');
+  assert(room.stage === 'done', 'once both rivers are in, the stage is "done"');
 
   // ---- nothing left to advance ----
   const nothingLeft = await api('POST', `/api/rooms/${code}/advance`, { playerId: hostId, action: 'done' });
@@ -168,7 +211,7 @@ async function main() {
     { id: hostId, name: 'Alice', assignment: hostSplit },
     { id: bobId, name: 'Bob', assignment: bobSplit }
   ];
-  const finalResult = G.computeResults(finalPlayers, [afterRiverB.json.room.boardA, afterRiverB.json.room.boardB], false);
+  const finalResult = G.computeResults(finalPlayers, [room.boardA, room.boardB], false);
   const sum = Object.values(finalResult.pointsByPlayer).reduce((a, b) => a + b, 0);
   assert(sum === 0, 'the fully-revealed hand, scored the same way the client will, is zero-sum');
 

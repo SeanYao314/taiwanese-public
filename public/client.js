@@ -1,7 +1,7 @@
 // public/client.js — Sweat Room UI: hand setup/arranging (same click-a-card-then-click-a-box
-// model as the Taiwanese Poker project), then the staged flop->turn->river sweat with a
-// live, multiway-friendly scoreboard (per player, per category, per board) plus a live win%/
-// projected-points line, and the baccarat-style peel for swingy rivers.
+// model as the Taiwanese Poker project), then the automatically-paced flop->turn->river sweat
+// with a live, side-by-side win%/scoreboard table (per player, per category, per board) and a
+// baccarat/ClubGG-style drag-to-squeeze reveal for swingy rivers.
 // Depends on window.Poker, window.Game, window.Equity (loaded as plain <script> tags).
 'use strict';
 
@@ -318,12 +318,29 @@
     { id: 'done' }
   ];
 
+  const STAGE_PASSIVE_LABEL = {
+    flops: 'Dealing both flops…',
+    turnA: 'Dealing the turn — Board A…',
+    turnB: 'Dealing the turn — Board B…'
+  };
+
+  // The reveal paces itself now — nobody clicks through flop/turn/river. In Solo, this
+  // browser's own setTimeout chain drives it (soloAutoTick below); in Multiplayer, the
+  // server drives it for everyone (lib/rooms.js) and this client just mirrors whatever it
+  // polls. Both sides use the same hold time, so the feel matches whichever mode you're in.
+  // Tests can speed the solo timers up the same way the server's tests do, via
+  // window.__SWEAT_ROOM_FAST_TIMERS__.
+  const CLIENT_FAST = typeof window !== 'undefined' && !!window.__SWEAT_ROOM_FAST_TIMERS__;
+  const AUTO_INITIAL_MS = CLIENT_FAST ? 15 : 1000;
+  const AUTO_HOLD_MS = CLIENT_FAST ? 15 : 2500;
+
   const sweat = {
     mode: 'solo',      // 'solo' (this browser arranged every seat) or 'mp' (server-driven room)
     mpCode: null,
     mpIsHost: false,
     mpHostId: null,
-    pendingSwing: null, // multiplayer only — the server-computed river outs check, mirrored to every viewer
+    pendingSwing: null, // the river outs check — server-computed in mp (mirrored to every
+                         // viewer), locally computed in solo. { boardIndex, hasSwing, swingThreshold, outs }
     players: [],      // [{id, name, assignment}]
     boardA: [],
     boardB: [],
@@ -332,6 +349,25 @@
     stageIndex: 0,
     homerunMode: false
   };
+
+  // Guards the solo auto-advance timer chain against a stale tick firing after the hand's
+  // moved on (a new hand started, or we left the sweat screen) — every scheduled tick checks
+  // its own generation number against the current one before doing anything.
+  let soloAutoTimer = null;
+  let soloAutoGen = 0;
+
+  function clearSoloAutoTimer() {
+    if (soloAutoTimer) { clearTimeout(soloAutoTimer); soloAutoTimer = null; }
+  }
+  function scheduleSoloAuto(delayMs, fn) {
+    clearSoloAutoTimer();
+    const gen = soloAutoGen;
+    soloAutoTimer = setTimeout(() => {
+      soloAutoTimer = null;
+      if (gen !== soloAutoGen) return; // the hand moved on while we were waiting — no-op
+      fn();
+    }, delayMs);
+  }
 
   function startSweat() {
     sweat.mode = 'solo';
@@ -345,6 +381,7 @@
     sweat.revealedB = 0;
     sweat.stageIndex = 0;
     sweat.homerunMode = setup.homerunMode;
+    soloAutoGen += 1;
 
     hide('setupScreen');
     show('sweatScreen');
@@ -354,6 +391,7 @@
     renderBoards();
     renderStage();
     recomputeStanding();
+    scheduleSoloAuto(AUTO_INITIAL_MS, soloAutoTick);
   }
 
   el('btnNewHand').addEventListener('click', async () => {
@@ -369,6 +407,8 @@
       // and handleMpRoomUpdate will bring everyone back to the room screen automatically.
       return;
     }
+    soloAutoGen += 1; // invalidate any pending auto-tick from this hand
+    clearSoloAutoTimer();
     hide('sweatScreen');
     show('setupScreen');
     show('preDealPanel');
@@ -377,7 +417,7 @@
   });
 
   // Only the host can actually start a new hand — hide the control for everyone else once
-  // we know we're in a multiplayer room (toggled from applyRoomToSweat/renderGuestWaiting).
+  // we know we're in a multiplayer room (toggled from applyRoomToSweat/renderStageMp).
   function syncNewHandButtonVisibility() {
     const btn = el('btnNewHand');
     if (sweat.mode === 'mp' && !sweat.mpIsHost) btn.classList.add('hidden');
@@ -403,11 +443,16 @@
   // Live standing (deterministic, "where do things stand right now") + equity
   // (probabilistic win%/projected points, looking ahead at what's still unseen)
   // ---------------------------------------------------------------------
+  function categoryLabelKey(boardIndex, cat) {
+    return (boardIndex === 0 ? 'A.' : 'B.') + cat;
+  }
+
   async function recomputeStanding() {
     const boardAKnown = sweat.boardA.slice(0, sweat.revealedA);
     const boardBKnown = sweat.boardB.slice(0, sweat.revealedB);
     const snapshot = G.computeLiveSnapshot(sweat.players, [boardAKnown, boardBKnown], sweat.homerunMode);
-    renderPlayerResults(snapshot, null);
+    renderCompareTable(snapshot);
+    updateCompareTablePercents(null);
 
     const loadingNotes = {};
     sweat.players.forEach((p) => { loadingNotes[p.id] = 'working out the odds…'; });
@@ -425,6 +470,7 @@
       }
     });
     renderEquityNotes(null, equity);
+    updateCompareTablePercents(equity);
 
     if (REVEAL_STAGES[sweat.stageIndex].id === 'done') renderShowdownExtras(snapshot);
   }
@@ -446,99 +492,131 @@
     return totals;
   }
 
-  function renderPlayerResults(snapshot, equity) {
+  // ---------------------------------------------------------------------
+  // Side-by-side compare table — one column per player, one row per category×board, with
+  // a live win% badge in every cell (even "pending" ones that can't be named as a hand yet,
+  // e.g. the 1-card hand before the turn — categoryWinPct is still meaningful there, it's
+  // just a probability instead of a certainty).
+  // ---------------------------------------------------------------------
+  function renderCompareTable(snapshot) {
     const cellPoints = cellPointTotals(snapshot);
     const wrap = el('resultsPlayers');
     wrap.innerHTML = '';
 
-    sweat.players.forEach((p) => {
-      const box = document.createElement('div');
-      box.className = 'player-result';
+    const scrollWrap = document.createElement('div');
+    scrollWrap.className = 'compare-scroll';
+    const table = document.createElement('table');
+    table.className = 'compare-table';
 
-      const head = document.createElement('div');
-      head.className = 'player-result-head';
+    const thead = document.createElement('thead');
+    const headRow = document.createElement('tr');
+    const corner = document.createElement('th');
+    corner.className = 'compare-corner';
+    headRow.appendChild(corner);
+
+    sweat.players.forEach((p) => {
+      const th = document.createElement('th');
+      th.className = 'compare-player-head';
+
+      const nameRow = document.createElement('div');
+      nameRow.className = 'cph-name-row';
       const pname = document.createElement('span');
       pname.className = 'pname';
       pname.textContent = p.name;
+      nameRow.appendChild(pname);
       const homeruns = snapshot.homeruns.filter((h) => h.winner === p.id);
       if (homeruns.length) {
         const tag = document.createElement('span');
         tag.className = 'homerun-tag';
-        tag.textContent = `⚾ HOMERUN${homeruns.length > 1 ? ' x' + homeruns.length : ''}`;
-        pname.appendChild(tag);
+        tag.textContent = `⚾${homeruns.length > 1 ? ' x' + homeruns.length : ''}`;
+        nameRow.appendChild(tag);
       }
+      th.appendChild(nameRow);
+
       const pts = snapshot.pointsByPlayer[p.id];
-      const pscore = document.createElement('span');
+      const pscore = document.createElement('div');
       pscore.className = 'pscore ' + (pts > 0 ? 'pos' : pts < 0 ? 'neg' : '');
       pscore.textContent = fmtSigned(pts) + ' so far';
-      head.appendChild(pname);
-      head.appendChild(pscore);
-      box.appendChild(head);
+      th.appendChild(pscore);
 
-      const sub = document.createElement('div');
-      sub.className = 'player-result-sub';
-      sub.id = 'equityNote-' + p.id;
-      sub.textContent = ' ';
-      box.appendChild(sub);
+      const note = document.createElement('div');
+      note.className = 'cph-note';
+      note.id = 'equityNote-' + p.id;
+      note.textContent = ' ';
+      th.appendChild(note);
 
-      const preview = document.createElement('div');
-      preview.className = 'hole-cards-preview';
-      ZONES.forEach((cat) => {
-        const group = document.createElement('span');
-        group.className = 'hc-group';
-        const lbl = document.createElement('span');
-        lbl.className = 'hc-label';
-        lbl.textContent = SLOT_TITLES[cat] + ':';
-        group.appendChild(lbl);
-        group.appendChild(cardRow(p.assignment[cat], { size: 'small', static: true }));
-        preview.appendChild(group);
-      });
-      box.appendChild(preview);
+      headRow.appendChild(th);
+    });
+    thead.appendChild(headRow);
+    table.appendChild(thead);
 
-      ZONES.forEach((cat) => {
-        const row = document.createElement('div');
-        row.className = 'cat-row';
-        const labelDiv = document.createElement('div');
-        labelDiv.className = 'cat-label';
-        labelDiv.textContent = SLOT_TITLES[cat];
-        row.appendChild(labelDiv);
+    const tbody = document.createElement('tbody');
+    ZONES.forEach((cat) => {
+      const groupRow = document.createElement('tr');
+      groupRow.className = 'compare-group-row';
+      const groupTd = document.createElement('td');
+      groupTd.colSpan = sweat.players.length + 1;
+      groupTd.textContent = SLOT_TITLES[cat];
+      groupRow.appendChild(groupTd);
+      tbody.appendChild(groupRow);
 
-        [0, 1].forEach((boardIndex) => {
+      [0, 1].forEach((boardIndex) => {
+        const row = document.createElement('tr');
+        row.className = 'compare-row';
+        const labelTd = document.createElement('td');
+        labelTd.className = 'compare-row-label';
+        labelTd.textContent = boardIndex === 0 ? 'Board A' : 'Board B';
+        row.appendChild(labelTd);
+
+        sweat.players.forEach((p) => {
           const evalInfo = snapshot.evals[p.id][cat][boardIndex];
-          const cell = document.createElement('div');
-          cell.className = 'board-eval';
-          const boardLabel = boardIndex === 0 ? 'Board A: ' : 'Board B: ';
+          const td = document.createElement('td');
+          td.className = 'compare-cell';
 
-          const catName = document.createElement('span');
-          catName.className = 'cat-name' + (evalInfo ? '' : ' pending');
-          catName.textContent = boardLabel + (evalInfo ? P.categoryName(evalInfo.score) : 'needs more board cards…');
-          cell.appendChild(catName);
-
+          const handRow = cardRow(p.assignment[cat], { size: 'small', static: true });
           if (evalInfo) {
             const usedSet = new Set(evalInfo.cards);
-            const handRow = cardRow(p.assignment[cat], { size: 'small', static: true });
             [...handRow.children].forEach((child, idx) => {
               if (usedSet.has(p.assignment[cat][idx])) child.classList.add('used-in-best');
             });
-            cell.appendChild(document.createElement('br'));
-            cell.appendChild(handRow);
+          }
+          td.appendChild(handRow);
 
+          const catName = document.createElement('div');
+          catName.className = 'cc-cat-name' + (evalInfo ? '' : ' pending');
+          catName.textContent = evalInfo ? P.categoryName(evalInfo.score) : 'pending…';
+          td.appendChild(catName);
+
+          const badgeRow = document.createElement('div');
+          badgeRow.className = 'cc-badge-row';
+
+          const pctBadge = document.createElement('span');
+          pctBadge.className = 'pct-badge';
+          pctBadge.id = `pctBadge-${p.id}-${cat}-${boardIndex}`;
+          pctBadge.title = 'Chance of winning this category on this board';
+          pctBadge.textContent = '…';
+          badgeRow.appendChild(pctBadge);
+
+          if (evalInfo) {
             const current = cellPoints[p.id][cat][boardIndex];
             const ptsBadge = document.createElement('span');
             ptsBadge.className = 'cell-points ' + (current > 0 ? 'pos' : current < 0 ? 'neg' : 'even');
             ptsBadge.textContent = fmtSigned(current);
-            cell.appendChild(ptsBadge);
-            cell.classList.add(current > 0 ? 'cell-pos' : current < 0 ? 'cell-neg' : 'cell-even');
+            badgeRow.appendChild(ptsBadge);
+            td.classList.add(current > 0 ? 'cell-pos' : current < 0 ? 'cell-neg' : 'cell-even');
           }
+          td.appendChild(badgeRow);
 
-          row.appendChild(cell);
+          row.appendChild(td);
         });
 
-        box.appendChild(row);
+        tbody.appendChild(row);
       });
-
-      wrap.appendChild(box);
     });
+    table.appendChild(tbody);
+
+    scrollWrap.appendChild(table);
+    wrap.appendChild(scrollWrap);
 
     if (snapshot.homeruns.length) {
       const nameById = {};
@@ -558,17 +636,34 @@
     }
   }
 
+  // Fills in (or clears, while still computing) the per-cell win% badges without rebuilding
+  // the whole table — equity may be null while the computation is still running.
+  function updateCompareTablePercents(equity) {
+    sweat.players.forEach((p) => {
+      ZONES.forEach((cat) => {
+        [0, 1].forEach((boardIndex) => {
+          const badge = el(`pctBadge-${p.id}-${cat}-${boardIndex}`);
+          if (!badge) return;
+          if (!equity) { badge.textContent = '…'; return; }
+          const label = categoryLabelKey(boardIndex, cat);
+          const pct = equity.categoryWinPct[p.id][label];
+          badge.textContent = Math.round(pct * 100) + '%';
+        });
+      });
+    });
+  }
+
   function renderEquityNotes(loadingNotes, equity) {
     sweat.players.forEach((p) => {
       const sub = el('equityNote-' + p.id);
       if (!sub) return;
       if (loadingNotes) {
-        sub.textContent = loadingNotes[p.id] || ' ';
+        sub.textContent = loadingNotes[p.id] || ' ';
         return;
       }
       if (!equity) return;
       if (equity.mode === 'determined') {
-        sub.textContent = ' ';
+        sub.textContent = ' ';
         return;
       }
       const win = (equity.winPct[p.id] * 100).toFixed(1);
@@ -614,75 +709,44 @@
   }
 
   // ---------------------------------------------------------------------
-  // Reveal controls / stage driver
+  // Solo auto-advance driver — mirrors the server's autoTick/autoRiverCheck/completeRiver
+  // (lib/rooms.js) so Solo and Multiplayer feel identical: nothing to click for flop/turn/
+  // river, except physically completing the squeeze on a river that turns out to be a
+  // swing spot.
   // ---------------------------------------------------------------------
-  function renderStage() {
-    const stage = REVEAL_STAGES[sweat.stageIndex];
-    if (sweat.mode === 'mp') {
-      if (!sweat.mpIsHost) { renderGuestWaiting(stage.id); return; }
-      if (stage.id === 'flops') renderFlopsControlMp();
-      else if (stage.id === 'turnA' || stage.id === 'turnB') renderTurnControlMp(stage.board);
-      else if (stage.id === 'riverA' || stage.id === 'riverB') renderRiverStageMp(stage.board);
-      else renderDoneStageMp();
-      return;
-    }
-    if (stage.id === 'flops') renderFlopsControl();
-    else if (stage.id === 'turnA' || stage.id === 'turnB') renderTurnControl(stage.board);
-    else if (stage.id === 'riverA' || stage.id === 'riverB') renderRiverStage(stage.board);
-    else renderDoneStage();
-  }
-
-  function renderFlopsControl() {
-    el('revealControls').innerHTML = '';
-    const block = document.createElement('div');
-    block.className = 'control-block';
-    const label = document.createElement('div');
-    label.className = 'control-label';
-    label.textContent = 'Both flops, revealed together';
-    const btn = document.createElement('button');
-    btn.type = 'button';
-    btn.className = 'primary';
-    btn.style.width = 'auto';
-    btn.textContent = 'Reveal Both Flops';
-    btn.addEventListener('click', async () => {
-      btn.disabled = true;
+  async function soloAutoTick() {
+    const stage = REVEAL_STAGES[sweat.stageIndex].id;
+    if (stage === 'flops') {
       sweat.revealedA = 3;
       sweat.revealedB = 3;
-      renderBoards();
-      sweat.stageIndex = 1;
-      await recomputeStanding();
-      renderStage();
-    });
-    block.appendChild(label);
-    block.appendChild(btn);
-    el('revealControls').appendChild(block);
-  }
-
-  function renderTurnControl(boardIndex) {
-    el('revealControls').innerHTML = '';
-    const block = document.createElement('div');
-    block.className = 'control-block';
-    const label = document.createElement('div');
-    label.className = 'control-label';
-    label.textContent = `Turn — Board ${boardIndex === 0 ? 'A' : 'B'}`;
-    const btn = document.createElement('button');
-    btn.type = 'button';
-    btn.className = 'reveal-card-btn';
-    btn.addEventListener('click', async () => {
-      btn.style.pointerEvents = 'none';
-      if (boardIndex === 0) sweat.revealedA = 4; else sweat.revealedB = 4;
-      renderBoards();
       sweat.stageIndex += 1;
-      await recomputeStanding();
+      renderBoards();
       renderStage();
-    });
-    block.appendChild(label);
-    block.appendChild(btn);
-    el('revealControls').appendChild(block);
+      await recomputeStanding();
+      scheduleSoloAuto(AUTO_HOLD_MS, soloAutoTick);
+    } else if (stage === 'turnA') {
+      sweat.revealedA = 4;
+      sweat.stageIndex += 1;
+      renderBoards();
+      renderStage();
+      await recomputeStanding();
+      scheduleSoloAuto(AUTO_HOLD_MS, soloAutoTick);
+    } else if (stage === 'turnB') {
+      sweat.revealedB = 4;
+      sweat.stageIndex += 1;
+      renderBoards();
+      renderStage();
+      await recomputeStanding();
+      scheduleSoloAuto(AUTO_HOLD_MS, soloAutoTick);
+    } else if (stage === 'riverA' || stage === 'riverB') {
+      await soloAutoRiverCheck(stage === 'riverA' ? 0 : 1);
+    }
+    // 'done' — nothing left to tick.
   }
 
-  async function renderRiverStage(boardIndex) {
-    el('revealControls').innerHTML = `<div class="control-block"><div class="control-label">Checking the river for outs…</div></div>`;
+  async function soloAutoRiverCheck(boardIndex) {
+    const gen = soloAutoGen;
+    renderStage(); // "Checking the river for outs…"
     const boards = [sweat.boardA.slice(0, sweat.revealedA), sweat.boardB.slice(0, sweat.revealedB)];
     const swing = await E.computeRiverSwing({
       players: sweat.players,
@@ -690,8 +754,67 @@
       pendingBoardIndex: boardIndex,
       homerunMode: sweat.homerunMode
     });
-    renderOutsPanel(swing);
-    renderRiverControl(boardIndex, swing.hasSwing);
+    if (gen !== soloAutoGen) return; // the hand moved on while we were awaiting the check
+    sweat.pendingSwing = {
+      boardIndex,
+      hasSwing: swing.hasSwing,
+      swingThreshold: swing.swingThreshold,
+      outs: swing.outs
+    };
+    renderOutsPanel(sweat.pendingSwing);
+    renderStage();
+    if (!swing.hasSwing) {
+      scheduleSoloAuto(AUTO_HOLD_MS, () => completeRiverAuto(boardIndex));
+    }
+    // if it IS a swing: stop here — renderStage() is now showing the squeeze trigger, and
+    // only the player physically completing that squeeze (see openSqueezeModal) moves on.
+  }
+
+  function completeRiverAuto(boardIndex) {
+    if (boardIndex === 0) sweat.revealedA = 5; else sweat.revealedB = 5;
+    sweat.pendingSwing = null;
+    el('outsPanel').classList.add('hidden');
+    sweat.stageIndex += 1;
+    renderBoards();
+    recomputeStanding().then(() => {
+      renderStage();
+      if (REVEAL_STAGES[sweat.stageIndex].id !== 'done') scheduleSoloAuto(AUTO_HOLD_MS, soloAutoTick);
+    });
+  }
+
+  // ---------------------------------------------------------------------
+  // Reveal status — a passive display everywhere except the squeeze (the one gesture that's
+  // still ever physically done by a person).
+  // ---------------------------------------------------------------------
+  function renderStage() {
+    const stage = REVEAL_STAGES[sweat.stageIndex];
+    if (sweat.mode === 'mp') { renderStageMp(stage); return; }
+    renderStageSolo(stage);
+  }
+
+  function renderStageSolo(stage) {
+    el('revealControls').innerHTML = '';
+    if (stage.id === 'done') {
+      el('revealControls').innerHTML = `<div class="control-block"><div class="control-label">🏁 Showdown complete</div></div>`;
+      return;
+    }
+    if (stage.id === 'flops' || stage.id === 'turnA' || stage.id === 'turnB') {
+      el('revealControls').innerHTML = `<div class="control-block"><div class="control-label">${STAGE_PASSIVE_LABEL[stage.id]}</div></div>`;
+      return;
+    }
+    // riverA / riverB
+    const boardIndex = stage.board;
+    if (!sweat.pendingSwing || sweat.pendingSwing.boardIndex !== boardIndex) {
+      el('revealControls').innerHTML = `<div class="control-block"><div class="control-label">Checking the river for outs…</div></div>`;
+      return;
+    }
+    if (sweat.pendingSwing.hasSwing) {
+      const cardIndex = boardIndex === 0 ? sweat.revealedA : sweat.revealedB;
+      const card = (boardIndex === 0 ? sweat.boardA : sweat.boardB)[cardIndex];
+      renderSqueezeControl(boardIndex, card, () => completeRiverAuto(boardIndex));
+    } else {
+      el('revealControls').innerHTML = `<div class="control-block"><div class="control-label">Revealing the river — Board ${boardIndex === 0 ? 'A' : 'B'}…</div></div>`;
+    }
   }
 
   function renderOutsPanel(swing) {
@@ -718,148 +841,148 @@
     return `<span class="out-chip ${SUIT_CLASS[suit]}">${card[0]}${SUIT_SYMBOL[suit]}</span>`;
   }
 
-  function completeRiver(boardIndex) {
-    return async () => {
-      if (boardIndex === 0) sweat.revealedA = 5; else sweat.revealedB = 5;
-      renderBoards();
-      el('outsPanel').classList.add('hidden');
-      sweat.stageIndex += 1;
-      await recomputeStanding();
-      renderStage();
-    };
-  }
+  // ---------------------------------------------------------------------
+  // Baccarat/ClubGG-style squeeze: tap a small face-down trigger to open a bigger card,
+  // then DRAG (not hold) to bend it open — drag distance drives a 3D rotateY flip, so you
+  // see the card thin out edge-on around the halfway point ("how many sides") before the
+  // true face appears past it. Release early and it snaps back face-down; drag far enough
+  // (or let go past the lock angle) and it completes the flip.
+  // ---------------------------------------------------------------------
+  const SQUEEZE_DRAG_RANGE = 220;   // px of drag to go from fully-back (0°) to fully-open (180°)
+  const SQUEEZE_LOCK_ANGLE = 150;   // release at/past this angle completes the flip instead of snapping back
 
-  function renderRiverControl(boardIndex, hasSwing) {
+  function renderSqueezeControl(boardIndex, card, onComplete) {
     el('revealControls').innerHTML = '';
     const block = document.createElement('div');
     block.className = 'control-block';
     const label = document.createElement('div');
     label.className = 'control-label';
-    label.textContent = hasSwing
-      ? `River — Board ${boardIndex === 0 ? 'A' : 'B'} — hold to peel`
-      : `River — Board ${boardIndex === 0 ? 'A' : 'B'}`;
+    label.textContent = `River — Board ${boardIndex === 0 ? 'A' : 'B'} — tap to squeeze`;
     block.appendChild(label);
-
-    const card = (boardIndex === 0 ? sweat.boardA : sweat.boardB)[boardIndex === 0 ? sweat.revealedA : sweat.revealedB];
-
-    if (hasSwing) {
-      block.appendChild(createPeelCard(card, completeRiver(boardIndex)));
-    } else {
-      const btn = document.createElement('button');
-      btn.type = 'button';
-      btn.className = 'reveal-card-btn';
-      btn.addEventListener('click', () => {
-        btn.style.pointerEvents = 'none';
-        completeRiver(boardIndex)();
-      });
-      block.appendChild(btn);
-    }
+    block.appendChild(createSqueezeTrigger(card, onComplete));
     el('revealControls').appendChild(block);
   }
 
-  function renderDoneStage() {
-    el('revealControls').innerHTML = `<div class="control-block"><div class="control-label">🏁 Showdown complete</div></div>`;
+  // `card` may be null — in multiplayer the server never sends an unrevealed card's value to
+  // ANY client (not even the host), so the squeeze plays out not knowing its own face until
+  // the drag completes and the server confirms the reveal; the caller swaps in the real
+  // board state (via renderBoards, once the server responds) after that.
+  function createSqueezeTrigger(card, onComplete) {
+    const trigger = document.createElement('button');
+    trigger.type = 'button';
+    trigger.className = 'squeeze-trigger';
+    trigger.setAttribute('aria-label', 'Tap to squeeze the river');
+    trigger.innerHTML = '<span class="squeeze-trigger-mark">?</span><span class="squeeze-trigger-hint">Tap to squeeze</span>';
+    trigger.addEventListener('click', () => openSqueezeModal(card, onComplete));
+    return trigger;
   }
 
-  // ---------------------------------------------------------------------
-  // Baccarat-style hold-to-peel card
-  // ---------------------------------------------------------------------
-  // `card` may be null — in multiplayer the server never sends an unrevealed card's value
-  // to ANY client (not even the host), so the peel plays out without knowing what's
-  // underneath until the hold completes and the reveal is confirmed server-side; the caller
-  // swaps in the real board state (via renderBoards) once that confirmation comes back.
-  function createPeelCard(card, onComplete) {
+  function openSqueezeModal(card, onComplete) {
     const rank = card ? card[0] : '?';
     const suit = card ? card[1] : null;
 
-    const wrapper = document.createElement('div');
-    wrapper.className = 'peel-card';
+    const overlay = document.createElement('div');
+    overlay.className = 'squeeze-overlay';
+
+    const stage = document.createElement('div');
+    stage.className = 'squeeze-stage';
+
+    const hint = document.createElement('div');
+    hint.className = 'squeeze-hint';
+    hint.textContent = 'Drag to peel it open — let go early and it snaps back';
+
+    const cardOuter = document.createElement('div');
+    cardOuter.className = 'squeeze-card';
+
+    const inner = document.createElement('div');
+    inner.className = 'squeeze-inner';
+
+    const back = document.createElement('div');
+    back.className = 'squeeze-face squeeze-back';
 
     const face = document.createElement('div');
-    face.className = 'peel-face' + (suit ? ' ' + SUIT_CLASS[suit] : '');
+    face.className = 'squeeze-face squeeze-front' + (suit ? ' ' + SUIT_CLASS[suit] : '');
     face.innerHTML = suit
       ? `<span class="rank">${rank}</span><span class="suit">${SUIT_SYMBOL[suit]}</span>`
       : `<span class="rank">?</span>`;
 
-    const back = document.createElement('div');
-    back.className = 'peel-back';
+    inner.appendChild(back);
+    inner.appendChild(face);
+    cardOuter.appendChild(inner);
+    stage.appendChild(cardOuter);
+    stage.appendChild(hint);
+    overlay.appendChild(stage);
+    document.body.appendChild(overlay);
 
-    const hint = document.createElement('div');
-    hint.className = 'peel-hint';
-    hint.textContent = 'Hold to peel';
+    let angle = 0;
+    let dragging = false;
+    let startX = 0;
+    let startAngle = 0;
+    let locked = false;
 
-    wrapper.appendChild(face);
-    wrapper.appendChild(back);
-    wrapper.appendChild(hint);
-
-    const DURATION = 1300;
-    const SNAPBACK_DURATION = 220;
-    let progress = 0;
-    let holding = false;
-    let startTime = 0;
-    let rafId = null;
-    let done = false;
-
-    function setProgress(p) {
-      progress = Math.max(0, Math.min(1, p));
-      back.style.clipPath = `inset(${(progress * 100).toFixed(2)}% 0 0 0)`;
-      const lift = Math.min(progress, 0.3) / 0.3;
-      wrapper.style.transform = `translateY(${-lift * 3}px) rotateZ(${-lift * 2}deg)`;
+    function applyAngle(a) {
+      angle = Math.max(0, Math.min(180, a));
+      inner.style.transform = `rotateY(${angle}deg)`;
+      // How "edge-on" the card looks right now (1 at 90°, where you're seeing it side-on —
+      // "how many sides" — and 0 at either face) drives a subtle width/shadow pinch.
+      const edgeOn = Math.sin((angle * Math.PI) / 180);
+      cardOuter.style.setProperty('--edge-factor', (1 - edgeOn * 0.55).toFixed(3));
     }
 
-    function tick(now) {
-      if (!holding) return;
-      const elapsed = now - startTime;
-      setProgress(elapsed / DURATION);
-      if (progress >= 1) { lock(); return; }
-      rafId = requestAnimationFrame(tick);
+    function cleanup() {
+      window.removeEventListener('pointermove', onPointerMove);
+      window.removeEventListener('pointerup', onPointerUp);
+      window.removeEventListener('pointercancel', onPointerUp);
     }
 
-    function lock() {
-      if (done) return;
-      done = true;
-      holding = false;
-      wrapper.classList.add('locked');
-      wrapper.style.transform = '';
-      if (rafId) cancelAnimationFrame(rafId);
-      onComplete();
+    function finishLock() {
+      if (locked) return;
+      locked = true;
+      cleanup();
+      inner.style.transition = 'transform .18s ease-out';
+      applyAngle(180);
+      setTimeout(() => {
+        overlay.classList.add('squeeze-closing');
+        setTimeout(() => {
+          overlay.remove();
+          onComplete();
+        }, 180);
+      }, 160);
     }
 
     function snapBack() {
-      holding = false;
-      if (rafId) cancelAnimationFrame(rafId);
-      const from = progress;
-      const start = performance.now();
-      function snapTick(now) {
-        if (done) return;
-        const t = Math.min(1, (now - start) / SNAPBACK_DURATION);
-        setProgress(from * (1 - t));
-        if (t < 1) requestAnimationFrame(snapTick);
-      }
-      requestAnimationFrame(snapTick);
+      inner.style.transition = 'transform .22s ease-out';
+      applyAngle(0);
     }
 
-    function onDown(e) {
-      if (done) return;
+    function onPointerDown(e) {
+      if (locked) return;
       e.preventDefault();
-      try { wrapper.setPointerCapture(e.pointerId); } catch (err) { /* ignore */ }
-      holding = true;
-      progress = 0;
-      startTime = performance.now();
-      rafId = requestAnimationFrame(tick);
+      dragging = true;
+      startX = e.clientX;
+      startAngle = angle;
+      inner.style.transition = 'none';
+      try { cardOuter.setPointerCapture(e.pointerId); } catch (err) { /* ignore — not critical */ }
     }
-    function onUp() {
-      if (done || !holding) return;
-      if (progress < 1) snapBack();
+    function onPointerMove(e) {
+      if (!dragging || locked) return;
+      const dx = e.clientX - startX;
+      applyAngle(startAngle + (dx / SQUEEZE_DRAG_RANGE) * 180);
+      if (angle >= 180) finishLock();
+    }
+    function onPointerUp() {
+      if (!dragging || locked) return;
+      dragging = false;
+      if (angle >= SQUEEZE_LOCK_ANGLE) finishLock();
+      else snapBack();
     }
 
-    wrapper.addEventListener('pointerdown', onDown);
-    wrapper.addEventListener('pointerup', onUp);
-    wrapper.addEventListener('pointercancel', onUp);
-    wrapper.addEventListener('pointerleave', onUp);
+    cardOuter.addEventListener('pointerdown', onPointerDown);
+    window.addEventListener('pointermove', onPointerMove);
+    window.addEventListener('pointerup', onPointerUp);
+    window.addEventListener('pointercancel', onPointerUp);
 
-    setProgress(0);
-    return wrapper;
+    applyAngle(0);
   }
 
   // =======================================================================
@@ -867,23 +990,22 @@
   // endpoints in server.js), so a link can actually be shared: each seat is a different
   // browser/device, your own 7 cards stay secret from everyone else until the whole table
   // is ready (then hands are "tabled" — shown to everyone, like a real sweat — and the
-  // board reveal that follows is driven by the host and mirrored to every other viewer).
+  // board reveal that follows paces itself on the server's own clock and is mirrored to
+  // every viewer).
   //
-  // The host's own reveal clicks update local state immediately (so the host's UI never
-  // waits on its own round-trip), and a single poll loop keeps everyone (host included, for
-  // seat-list/presence and as a safety net) in sync the rest of the time. A small monotonic
-  // guard (sweatKeyFor + "never apply a stageIndex that's older than what we've already
-  // shown") stops a slow/late poll response from ever visually rolling the reveal backwards.
+  // The host's own squeeze completion updates local state immediately (so the host's UI
+  // never waits on its own round-trip for that), and a single poll loop keeps everyone
+  // (host included, for seat-list/presence and as a safety net) in sync the rest of the
+  // time. A small monotonic guard (sweatKeyFor + "never apply a stageIndex that's older
+  // than what we've already shown") stops a slow/late poll response from ever visually
+  // rolling the reveal backwards.
   // =======================================================================
   const MP_SESSION_KEY = 'sweat-room-mp-session';
-  const MP_POLL_MS = 1200;
-  const MP_STAGE_LABEL = {
-    flops: 'both flops',
-    turnA: 'the Board A turn',
-    turnB: 'the Board B turn',
-    riverA: 'the Board A river',
-    riverB: 'the Board B river'
-  };
+  // Tests set window.__SWEAT_ROOM_FAST_TIMERS__ to shrink the server's own auto-pacing
+  // holds down to milliseconds (see lib/rooms.js) — polling at the normal production
+  // cadence would then miss most of the intermediate stages entirely, racing straight to
+  // the end before ever observing them, so the poll speeds up to match.
+  const MP_POLL_MS = CLIENT_FAST ? 10 : 1200;
 
   const mp = {
     code: null,
@@ -1168,10 +1290,9 @@
   }
 
   // ---------------------------------------------------------------------
-  // Sweat — host-only reveal controls (mirrors solo's, but talks to the server); everyone
-  // else sees a passive "waiting for the host" message plus whatever outs panel the host's
-  // river-swing check produced (identical for every viewer, since the server computed it
-  // once and broadcasts the same result to all of them).
+  // Sweat — passive auto-paced status for everyone (host included), mirroring whatever the
+  // server polls back; the only remaining action anyone ever takes here is the host
+  // physically completing the squeeze on a river the server flagged as a swing spot.
   // ---------------------------------------------------------------------
   function showMpSweatError(msg) {
     const div = document.createElement('div');
@@ -1181,130 +1302,53 @@
     el('revealControls').appendChild(div);
   }
 
-  function renderGuestWaiting(stageId) {
+  function renderStageMp(stage) {
+    renderOutsPanel(sweat.pendingSwing);
     el('revealControls').innerHTML = '';
-    const block = document.createElement('div');
-    block.className = 'control-block';
-    const label = document.createElement('div');
-    label.className = 'control-label';
-    if (stageId === 'done') {
-      label.textContent = '🏁 Showdown complete';
+    if (stage.id === 'done') {
+      el('revealControls').innerHTML = `<div class="control-block"><div class="control-label">🏁 Showdown complete</div></div>`;
+      return;
+    }
+    if (stage.id === 'flops' || stage.id === 'turnA' || stage.id === 'turnB') {
+      el('revealControls').innerHTML = `<div class="control-block"><div class="control-label">${STAGE_PASSIVE_LABEL[stage.id]}</div></div>`;
+      return;
+    }
+    // riverA / riverB
+    const boardIndex = stage.board;
+    const swing = sweat.pendingSwing;
+    if (!swing || swing.boardIndex !== boardIndex) {
+      el('revealControls').innerHTML = `<div class="control-block"><div class="control-label">Checking the river for outs…</div></div>`;
+      return;
+    }
+    if (!swing.hasSwing) {
+      el('revealControls').innerHTML = `<div class="control-block"><div class="control-label">Revealing the river — Board ${boardIndex === 0 ? 'A' : 'B'}…</div></div>`;
+      return;
+    }
+    // swing river — only the host ever squeezes; everyone else just watches
+    if (sweat.mpIsHost) {
+      // `card` is deliberately null — the real value only exists once the server confirms
+      // the reveal (see createSqueezeTrigger's comment above).
+      renderSqueezeControl(boardIndex, null, () => completeSqueezeMp(boardIndex));
     } else {
       const hostPlayer = sweat.players.find((p) => p.id === sweat.mpHostId);
       const hostName = hostPlayer ? hostPlayer.name : 'the host';
-      label.textContent = `Waiting for ${hostName} to reveal ${MP_STAGE_LABEL[stageId] || 'the next card'}…`;
+      el('revealControls').innerHTML = `<div class="control-block"><div class="control-label">⏳ ${escapeHtml(hostName)} is squeezing the Board ${boardIndex === 0 ? 'A' : 'B'} river…</div></div>`;
     }
-    block.appendChild(label);
-    el('revealControls').appendChild(block);
-    renderOutsPanel(sweat.pendingSwing);
   }
 
-  function renderFlopsControlMp() {
-    el('revealControls').innerHTML = '';
-    const block = document.createElement('div');
-    block.className = 'control-block';
-    const label = document.createElement('div');
-    label.className = 'control-label';
-    label.textContent = 'Both flops, revealed together';
-    const btn = document.createElement('button');
-    btn.type = 'button';
-    btn.className = 'primary';
-    btn.style.width = 'auto';
-    btn.textContent = 'Reveal Both Flops';
-    btn.addEventListener('click', async () => {
-      btn.disabled = true;
-      const resp = await mpApi('POST', `/api/rooms/${mp.code}/advance`, { playerId: mp.playerId, action: 'flops' });
-      if (resp.error) { showMpSweatError(resp.error); btn.disabled = false; return; }
-      mp.lastAppliedSweatKey = sweatKeyFor(resp.room);
-      applyRoomToSweat(resp.room);
-      renderBoards();
-      await recomputeStanding();
+  async function completeSqueezeMp(boardIndex) {
+    const action = boardIndex === 0 ? 'riverA' : 'riverB';
+    const resp = await mpApi('POST', `/api/rooms/${mp.code}/advance`, { playerId: mp.playerId, action });
+    if (resp.error) {
       renderStage();
-    });
-    block.appendChild(label);
-    block.appendChild(btn);
-    el('revealControls').appendChild(block);
-  }
-
-  function renderTurnControlMp(boardIndex) {
-    el('revealControls').innerHTML = '';
-    const block = document.createElement('div');
-    block.className = 'control-block';
-    const label = document.createElement('div');
-    label.className = 'control-label';
-    label.textContent = `Turn — Board ${boardIndex === 0 ? 'A' : 'B'}`;
-    const btn = document.createElement('button');
-    btn.type = 'button';
-    btn.className = 'reveal-card-btn';
-    btn.addEventListener('click', async () => {
-      btn.style.pointerEvents = 'none';
-      const action = boardIndex === 0 ? 'turnA' : 'turnB';
-      const resp = await mpApi('POST', `/api/rooms/${mp.code}/advance`, { playerId: mp.playerId, action });
-      if (resp.error) { showMpSweatError(resp.error); btn.style.pointerEvents = ''; return; }
-      mp.lastAppliedSweatKey = sweatKeyFor(resp.room);
-      applyRoomToSweat(resp.room);
-      renderBoards();
-      await recomputeStanding();
-      renderStage();
-    });
-    block.appendChild(label);
-    block.appendChild(btn);
-    el('revealControls').appendChild(block);
-  }
-
-  async function renderRiverStageMp(boardIndex) {
-    el('revealControls').innerHTML = `<div class="control-block"><div class="control-label">Checking the river for outs…</div></div>`;
-    const resp = await mpApi('POST', `/api/rooms/${mp.code}/river-swing`, { playerId: mp.playerId, board: boardIndex });
-    if (resp.error) { showMpSweatError(resp.error); return; }
+      showMpSweatError(resp.error);
+      return;
+    }
+    mp.lastAppliedSweatKey = sweatKeyFor(resp.room);
     applyRoomToSweat(resp.room);
-    renderOutsPanel(sweat.pendingSwing);
-    renderRiverControlMp(boardIndex, !!(sweat.pendingSwing && sweat.pendingSwing.hasSwing));
-  }
-
-  function completeRiverMp(boardIndex) {
-    return async () => {
-      el('outsPanel').classList.add('hidden');
-      const action = boardIndex === 0 ? 'riverA' : 'riverB';
-      const resp = await mpApi('POST', `/api/rooms/${mp.code}/advance`, { playerId: mp.playerId, action });
-      if (resp.error) { showMpSweatError(resp.error); return; }
-      mp.lastAppliedSweatKey = sweatKeyFor(resp.room);
-      applyRoomToSweat(resp.room);
-      renderBoards();
-      await recomputeStanding();
-      renderStage();
-    };
-  }
-
-  function renderRiverControlMp(boardIndex, hasSwing) {
-    el('revealControls').innerHTML = '';
-    const block = document.createElement('div');
-    block.className = 'control-block';
-    const label = document.createElement('div');
-    label.className = 'control-label';
-    label.textContent = hasSwing
-      ? `River — Board ${boardIndex === 0 ? 'A' : 'B'} — hold to peel`
-      : `River — Board ${boardIndex === 0 ? 'A' : 'B'}`;
-    block.appendChild(label);
-
-    if (hasSwing) {
-      // `card` is deliberately null here — the real value only exists once the server
-      // confirms the reveal (see createPeelCard's comment above).
-      block.appendChild(createPeelCard(null, completeRiverMp(boardIndex)));
-    } else {
-      const btn = document.createElement('button');
-      btn.type = 'button';
-      btn.className = 'reveal-card-btn';
-      btn.addEventListener('click', () => {
-        btn.style.pointerEvents = 'none';
-        completeRiverMp(boardIndex)();
-      });
-      block.appendChild(btn);
-    }
-    el('revealControls').appendChild(block);
-  }
-
-  function renderDoneStageMp() {
-    el('revealControls').innerHTML = `<div class="control-block"><div class="control-label">🏁 Showdown complete</div></div>`;
+    renderBoards();
+    await recomputeStanding();
+    renderStage();
   }
 
   // ---------------------------------------------------------------------
